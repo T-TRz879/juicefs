@@ -121,7 +121,7 @@ func randRead(buf []byte) {
 
 func (bc *benchCase) writeFiles(index int) {
 	for i := 0; i < bc.fcount; i++ {
-		fname := fmt.Sprintf("%s/%s.%d.%d", bc.bm.tmpdir, bc.name, index, i)
+		fname := filepath.Join(bc.bm.tmpdir, fmt.Sprintf("%s.%d.%d", bc.name, index, i))
 		fp, err := os.OpenFile(fname, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
 		if err != nil {
 			logger.Fatalf("Failed to open file %s: %s", fname, err)
@@ -140,7 +140,7 @@ func (bc *benchCase) writeFiles(index int) {
 
 func (bc *benchCase) readFiles(index int) {
 	for i := 0; i < bc.fcount; i++ {
-		fname := fmt.Sprintf("%s/%s.%d.%d", bc.bm.tmpdir, bc.name, index, i)
+		fname := filepath.Join(bc.bm.tmpdir, fmt.Sprintf("%s.%d.%d", bc.name, index, i))
 		fp, err := os.Open(fname)
 		if err != nil {
 			logger.Fatalf("Failed to open file %s: %s", fname, err)
@@ -158,7 +158,7 @@ func (bc *benchCase) readFiles(index int) {
 
 func (bc *benchCase) statFiles(index int) {
 	for i := 0; i < bc.fcount; i++ {
-		fname := fmt.Sprintf("%s/%s.%d.%d", bc.bm.tmpdir, bc.name, index, i)
+		fname := filepath.Join(bc.bm.tmpdir, fmt.Sprintf("%s.%d.%d", bc.name, index, i))
 		if _, err := os.Stat(fname); err != nil {
 			logger.Fatalf("Failed to stat file %s: %s", fname, err)
 		}
@@ -363,18 +363,6 @@ func bench(ctx *cli.Context) error {
 	dropCaches()
 	bm.colorful = utils.SupportANSIColor(os.Stdout.Fd())
 	progress := utils.NewProgress(false)
-	if b := bm.big; b != nil {
-		total := int64(bm.threads * b.fcount * b.bcount)
-		b.wbar = progress.AddCountBar("Write big blocks", total)
-		b.rbar = progress.AddCountBar("Read big blocks", total)
-	}
-	if s := bm.small; s != nil {
-		total := int64(bm.threads * s.fcount * s.bcount)
-		s.wbar = progress.AddCountBar("Write small blocks", total)
-		s.rbar = progress.AddCountBar("Read small blocks", total)
-		s.sbar = progress.AddCountBar("Stat small files", int64(bm.threads*s.fcount))
-	}
-
 	/* --- Run Benchmark --- */
 	var stats map[string]float64
 	if mp != "" {
@@ -383,6 +371,8 @@ func bench(ctx *cli.Context) error {
 	var result [][]string
 	result = append(result, []string{"ITEM", "VALUE", "COST"})
 	if b := bm.big; b != nil {
+		total := int64(bm.threads * b.fcount * b.bcount)
+		b.wbar = progress.AddCountBar("Write big blocks", total)
 		cost := b.run("write")
 		b.wbar.Done()
 		line := make([]string, 3)
@@ -393,6 +383,7 @@ func bench(ctx *cli.Context) error {
 		result = append(result, line)
 		dropCaches()
 
+		b.rbar = progress.AddCountBar("Read big blocks", total)
 		cost = b.run("read")
 		b.rbar.Done()
 		line = make([]string, 3)
@@ -403,6 +394,8 @@ func bench(ctx *cli.Context) error {
 		result = append(result, line)
 	}
 	if s := bm.small; s != nil {
+		total := int64(bm.threads * s.fcount * s.bcount)
+		s.wbar = progress.AddCountBar("Write small blocks", total)
 		cost := s.run("write")
 		s.wbar.Done()
 		line := make([]string, 3)
@@ -413,6 +406,7 @@ func bench(ctx *cli.Context) error {
 		result = append(result, line)
 		dropCaches()
 
+		s.rbar = progress.AddCountBar("Read small blocks", total)
 		cost = s.run("read")
 		s.rbar.Done()
 		line = make([]string, 3)
@@ -423,6 +417,7 @@ func bench(ctx *cli.Context) error {
 		result = append(result, line)
 		dropCaches()
 
+		s.sbar = progress.AddCountBar("Stat small files", int64(bm.threads*s.fcount))
 		cost = s.run("stat")
 		s.sbar.Done()
 		line = make([]string, 3)

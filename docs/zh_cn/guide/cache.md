@@ -94,7 +94,7 @@ JuiceFS 客户端在 `open` 操作即打开一个文件时，其文件属性会�
 
 ### 写入 {#buffer-write}
 
-调用 `write` 成功，并不代表数据被持久化，持久化是 `flush` 的工作。这一点不论对于本地文件系统，还是 JuiceFS 文件系统，都是一样的。在 JuiceFS 中，`write` 会将数据写入缓冲区，写入完毕以后，你甚至会注意到，当前挂载点已经看到文件长度有所变化，不要误会，这并不代表写入已经持久化（这点也在[一致性例外](#consistency-exceptions)话题上有更详细介绍）。总而言之，在 `flush` 来临之前，改动只存在于客户端缓冲区。应用可以显式调用 `flush`，但就算不这样做，当写入超过一个 Chunk 边界，或者在缓冲区停留超过一定时间，都会触发自动 `flush`。
+调用 `write` 成功，并不代表数据被持久化，持久化是 `flush` 的工作。这一点不论对于本地文件系统，还是 JuiceFS 文件系统，都是一样的。在 JuiceFS 中，`write` 会将数据写入缓冲区，写入完毕以后，你甚至会注意到，当前挂载点已经看到文件长度有所变化，不要误会，这并不代表写入已经持久化（这点也在[一致性例外](#consistency-exceptions)话题上有更详细介绍）。总而言之，在 `flush` 来临之前，改动只存在于客户端缓冲区。应用可以显式调用 `flush`，但就算不这样做，当写入超过块大小（默认 4M），或者在缓冲区停留超过一定时间，都会触发自动 `flush`。
 
 结合上方已经介绍过的预读，缓冲区的总体作用可以一张图表示：
 
@@ -112,15 +112,11 @@ JuiceFS 客户端在 `open` 操作即打开一个文件时，其文件属性会�
 
 在调整缓冲区大小前，我们推荐使用 [`juicefs stats`](../administration/fault_diagnosis_and_analysis.md#stats) 来观察当前的缓冲区用量大小，这个命令能直观反映出当前的读写性能问题。
 
-如果你希望增加写入速度，通过调整 [`--max-uploads`](../reference/command_reference.md#mount-data-storage-options) 增大了上传并发度，但并没有观察到上行带宽用量有明显增加，那么此时可能就需要相应地调大 `--buffer-size`，让并发线程更容易申请到内存来工作。这个排查原理反之亦然：如果增大 `--buffer-size` 却没有观察到上行带宽占用提升，也可以考虑增大 `--max-uploads` 来提升上传并发度。
-
-可想而知，`--buffer-size` 也控制着每次 `flush` 操作的上传数据量大小，因此如果客户端处在一个低带宽的网络环境下，可能反而需要降低 `--buffer-size` 来避免 `flush` 超时。关于低带宽场景排查请详见「[与对象存储通信不畅](../administration/troubleshooting.md#io-error-object-storage)」。
-
 如果希望增加顺序读速度，可以增加 `--buffer-size`，来放大预读窗口，窗口内尚未下载到本地的数据块，会并发地异步下载。同时注意，单个文件的预读不会把整个缓冲区用完，限制为 1/4 到 1/2。因此如果在优化单个大文件的顺序读时发现 `juicefs stats` 中 `buf` 用量已经接近一半，说明该文件的预读额度已满，此时虽然缓冲区还有空闲，但也需要继续增加 `--buffer-size` 才能进一步提升单个大文件的预读性能。
 
 挂载参数 [`--buffer-size`](../reference/command_reference.md#mount-data-storage-options) 控制着 JuiceFS 的读写缓冲区大小，默认 300（单位 MiB）。读写缓冲区的大小决定了读取文件以及预读（readahead）的内存数据量，同时也控制着写缓存（pending page）的大小。因此在面对高并发读写场景的时候，我们推荐对 `--buffer-size` 进行相应的扩容，能有效提升性能。
 
-如果你希望增加写入速度，通过调整 [`--max-uploads`](../reference/command_reference.md#mount) 增大了上传并发度，但并没有观察到上行带宽用量有明显增加，那么此时可能就需要相应地调大 `--buffer-size`，让并发线程更容易申请到内存来工作。这个排查原理反之亦然：如果增大 `--buffer-size` 却没有观察到上行带宽占用提升，也可以考虑增大 `--max-uploads` 来提升上传并发度。
+如果你希望增加写入速度，通过调整 [`--max-uploads`](../reference/command_reference.md#mount-data-storage-options) 增大了上传并发度，但并没有观察到上行带宽用量有明显增加，那么此时可能就需要相应地调大 `--buffer-size`，让并发线程更容易申请到内存来工作。这个排查原理反之亦然：如果增大 `--buffer-size` 却没有观察到上行带宽占用提升，也可以考虑增大 `--max-uploads` 来提升上传并发度。
 
 可想而知，`--buffer-size` 也控制着每次 `flush` 操作的上传数据量大小，因此如果客户端处在一个低带宽的网络环境下，可能反而需要降低 `--buffer-size` 来避免 `flush` 超时。关于低带宽场景排查请详见[「与对象存储通信不畅」](../administration/troubleshooting.md#io-error-object-storage)。
 
@@ -142,7 +138,7 @@ JuiceFS 客户端会跟踪所有最近被打开的文件，要重复打开相同
 
 从 Linux 内核 3.15 开始，FUSE 支持[内核回写（writeback-cache）](https://www.kernel.org/doc/Documentation/filesystems/fuse-io.txt)模式，内核会把高频随机小 IO（例如 10-100 字节）的写请求合并起来，显著提升随机写入的性能。但其副作用是会将顺序写变为随机写，严重降低顺序写的性能。开启前请考虑使用场景是否匹配。
 
-在挂载命令通过 [`-o writeback_cache`](../reference/fuse_mount_options.md) 选项来开启内核回写模式。注意，内核回写与[「客户端写缓存」](#writeback)并不一样，前者是内核中的实现，后者则发生在 JuiceFS 客户端，二者适用场景也不一样，详读对应章节以了解。
+在挂载命令通过 [`-o writeback_cache`](../reference/fuse_mount_options.md) 选项来开启内核回写模式。注意，内核回写与[「客户端写缓存」](#client-write-cache)并不一样，前者是内核中的实现，后者则发生在 JuiceFS 客户端，二者适用场景也不一样，详读对应章节以了解。
 
 ### 客户端读缓存 {#client-read-cache}
 
@@ -178,7 +174,7 @@ JuiceFS 客户端会把从对象存储下载的数据，以及新上传的小于
 
   读一般有两种模式，连续读和随机读。对于连续读，一般需要较高的吞吐。对于随机读，一般需要较低的时延。当本地磁盘的吞吐反而比不上对象存储时，可以考虑启用 `--cache-partial-only`，这样一来，连续读虽然会将一整个对象块读取下来，但并不会被缓存。而随机读（例如读 Parquet 或者 ORC 文件的 footer）所读取的字节数比较小，不会读取整个对象块，此类读取就会被缓存。充分地利用了本地磁盘低时延和网络高吞吐的优势。
 
-### 客户端写缓存 {#writeback}
+### 客户端写缓存 {#client-write-cache}
 
 开启客户端写缓存能提升特定场景下的大量小文件写入性能，请详读本节了解。
 

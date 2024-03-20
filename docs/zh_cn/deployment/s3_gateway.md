@@ -4,17 +4,16 @@ sidebar_position: 4
 slug: /s3_gateway
 ---
 
-JuiceFS 从 v0.11 开始引入了 S3 网关，这是一个通过 [MinIO S3 网关](https://docs.min.io/docs/minio-gateway-for-s3.html)实现的功能。它为 JuiceFS 中的文件提供跟 S3 兼容的 RESTful API，在不方便挂载的情况下能够用 s3cmd、AWS CLI、MinIO Client（mc）等工具管理 JuiceFS 上存储的文件。另外，S3 网关还提供了一个基于网页的文件管理器，用户使用浏览器就能对 JuiceFS 上的文件进行常规的增删管理。
+JuiceFS 会将文件[分块存储到底层的对象存储中](../introduction/architecture.md#how-juicefs-store-files)，暴露给用户的往往是 POSIX 接口，而如果你需要同时用 S3 兼容接口访问 JuiceFS 中的文件，就可以用到 S3 网关。其架构图如下：
 
-因为 JuiceFS 会将文件分块存储到底层的对象存储中，不能直接使用底层对象存储的接口和界面来直接访问文件，S3 网关提供了类似底层对象存储的访问能力，架构图如下：
+![JuiceFS S3 Gateway architecture](../images/juicefs-s3-gateway-arch.png)
 
-![JuiceFS-S3-gateway-arch](../images/juicefs-s3-gateway-arch.png)
+JuiceFS S3 网关是通过 [MinIO S3 网关](https://docs.min.io/docs/minio-gateway-for-s3.html)实现的功能，常见的使用场景有：
 
-## 先决条件
-
-S3 网关是建立在 JuiceFS 文件系统之上的功能，如果你还没有 JuiceFS 文件系统，请先参考 [快速上手指南](../getting-started/README.md) 创建一个。
-
-JuiceFS S3 网关是 v0.11 中引入的功能，请确保您拥有最新版本的 JuiceFS。
+* 为 JuiceFS 文件系统暴露 S3 接口，应用可以通过 S3 SDK 访问 JuiceFS 上存储的文件
+* 使用 s3cmd、AWS CLI、MinIO 客户端来方便地访问和操作 JuiceFS 上存储的文件
+* S3 网关还提供一个基于网页的文件管理器，使用浏览器就能对 JuiceFS 文件系统进行常规的增删管理
+* 在跨集群复制数据的场景下，作为集群的统一数据出口，避免跨区访问元数据以提升数据传输性能，详见[「使用 S3 网关进行跨区域数据同步」](../guide/sync.md#sync-across-region)
 
 ## 快速开始
 
@@ -150,6 +149,18 @@ $ mc ls juicefs/jfs
 [2021-10-20 11:59:10 CST]  11MiB work-4997565.svg
 ```
 
+### 使用虚拟路径格式
+
+默认情况下，Gateway 支持格式为 <http://mydomain.com/bucket/object> 的路径类型请求。
+`MINIO_DOMAIN` 环境变量被用来启用虚拟主机类型请求。如果请求的`Host`头信息匹配 `(.+).mydomain.com`，则匹配的模式 `$1` 被用作 bucket，并且路径被用作 object.
+示例：
+
+```shell
+
+export MINIO_DOMAIN=mydomain.com
+
+```
+
 ## 在 Kubernetes 中部署 S3 网关 {#deploy-in-kubernetes}
 
 ### 通过 kubectl 部署
@@ -244,7 +255,7 @@ Ingress 的各个版本之间差异较大，更多使用方式请参考 [Ingress
 
 1. 准备配置文件
 
-   创建一个配置文件，例如：`values.yaml`，复制并完善下列配置信息。其中，`secret` 部分是 JuiceFS 文件系统相关的信息，你可以参照 [JuiceFS 快速上手指南](../getting-started/README.md) 了解相关内容。
+   创建一个配置文件，例如：`values.yaml`，复制并完善下列配置信息。其中，`secret` 部分是 JuiceFS 文件系统相关的信息，你可以参照 [JuiceFS 快速上手指南](../getting-started/standalone.md) 了解相关内容。
 
    ```yaml title="values.yaml"
    secret:

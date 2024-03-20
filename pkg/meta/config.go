@@ -46,6 +46,8 @@ type Config struct {
 	Subdir             string
 	AtimeMode          string
 	DirStatFlushPeriod time.Duration
+	SkipDirMtime       time.Duration
+	Sid                uint64
 }
 
 func DefaultConf() *Config {
@@ -91,6 +93,7 @@ type Format struct {
 	MinClientVersion string `json:",omitempty"`
 	MaxClientVersion string `json:",omitempty"`
 	DirStats         bool   `json:",omitempty"`
+	EnableACL        bool
 }
 
 func (f *Format) update(old *Format, force bool) error {

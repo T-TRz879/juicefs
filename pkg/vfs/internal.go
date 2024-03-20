@@ -52,7 +52,7 @@ func (v *VFS) getControlHandle(pid uint32) uint64 {
 	defer controlMutex.Unlock()
 	fh := controlHandlers[pid]
 	if fh == 0 {
-		h := v.newHandle(controlInode)
+		h := v.newHandle(controlInode, false)
 		fh = h.fh
 		controlHandlers[pid] = fh
 	}
@@ -173,7 +173,7 @@ func collectMetrics(registry *prometheus.Registry) []byte {
 		for _, m := range mf.Metric {
 			var name = *mf.Name
 			for _, l := range m.Label {
-				if *l.Name != "mp" && *l.Name != "vol_name" {
+				if (name == "juicefs_object_request_durations_histogram_seconds" || name == "juicefs_object_request_data_bytes") && *l.Name == "method" {
 					name += "_" + *l.Value
 				}
 			}
@@ -281,6 +281,20 @@ type InfoResponse struct {
 type SummaryReponse struct {
 	Errno syscall.Errno
 	Tree  meta.TreeSummary
+}
+
+type CacheResponse struct {
+	FileCount  uint64
+	SliceCount uint64
+	TotalBytes uint64
+	MissBytes  uint64 // for check op
+}
+
+func (resp *CacheResponse) Add(other CacheResponse) {
+	resp.FileCount += other.FileCount
+	resp.TotalBytes += other.TotalBytes
+	resp.SliceCount += other.SliceCount
+	resp.MissBytes += other.MissBytes
 }
 
 type chunkSlice struct {
@@ -503,22 +517,58 @@ func (v *VFS) handleInternalMsg(ctx meta.Context, cmd uint32, r *utils.Buffer, o
 		w.Put32(uint32(len(data)))
 		w.Put(data)
 		_, _ = out.Write(w.Bytes())
+	case meta.CompactPath:
+		inode := Ino(r.Get64())
+		coCnt := r.Get16()
+
+		done := make(chan struct{})
+		var totalChunks, currChunks uint64
+		var eno syscall.Errno
+		go func() {
+			eno = v.Meta.Compact(ctx, inode, int(coCnt), func() {
+				atomic.AddUint64(&totalChunks, 1)
+			}, func() {
+				atomic.AddUint64(&currChunks, 1)
+			})
+			close(done)
+		}()
+
+		writeProgress(&totalChunks, &currChunks, out, done)
+		_, _ = out.Write([]byte{uint8(eno)})
+
 	case meta.FillCache:
 		paths := strings.Split(string(r.Get(int(r.Get32()))), "\n")
 		concurrent := r.Get16()
 		background := r.Get8()
+
+		action := WarmupCache
+		if r.HasMore() {
+			action = CacheAction(r.Get8())
+		}
+
+		var stat CacheResponse
 		if background == 0 {
-			var count, bytes uint64
 			done := make(chan struct{})
 			go func() {
-				v.fillCache(ctx, paths, int(concurrent), &count, &bytes)
+				v.cache(ctx, action, paths, int(concurrent), &stat)
 				close(done)
 			}()
-			writeProgress(&count, &bytes, out, done)
+			writeProgress(&stat.FileCount, &stat.TotalBytes, out, done)
 		} else {
-			go v.fillCache(meta.NewContext(ctx.Pid(), ctx.Uid(), ctx.Gids()), paths, int(concurrent), nil, nil)
+			go v.cache(meta.NewContext(ctx.Pid(), ctx.Uid(), ctx.Gids()), action, paths, int(concurrent), nil)
 		}
-		_, _ = out.Write([]byte{0})
+
+		data, err := json.Marshal(stat)
+		if err != nil {
+			logger.Errorf("marshal response error: %v", err)
+			_, _ = out.Write([]byte{byte(syscall.EIO & 0xff)})
+			return
+		}
+		w := utils.NewBuffer(uint32(1 + 4 + len(data)))
+		w.Put8(meta.CDATA)
+		w.Put32(uint32(len(data)))
+		w.Put(data)
+		_, _ = out.Write(w.Bytes())
 	default:
 		logger.Warnf("unknown message type: %d", cmd)
 		_, _ = out.Write([]byte{byte(syscall.EINVAL & 0xff)})

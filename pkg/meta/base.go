@@ -22,7 +22,6 @@ import (
 	"fmt"
 	"os"
 	"path"
-	"path/filepath"
 	"reflect"
 	"runtime"
 	"sort"
@@ -33,6 +32,7 @@ import (
 	"time"
 
 	"github.com/dustin/go-humanize"
+	aclAPI "github.com/juicedata/juicefs/pkg/acl"
 	"github.com/juicedata/juicefs/pkg/utils"
 	"github.com/juicedata/juicefs/pkg/version"
 	"github.com/pkg/errors"
@@ -41,11 +41,12 @@ import (
 )
 
 const (
-	inodeBatch    = 100
-	sliceIdBatch  = 1000
-	minUpdateTime = time.Millisecond * 10
-	nlocks        = 1024
+	inodeBatch   = 1 << 10
+	sliceIdBatch = 4 << 10
+	nlocks       = 1024
 )
+
+var maxCompactSlices = 1000
 
 type engine interface {
 	// Get the value of counter name.
@@ -59,7 +60,7 @@ type engine interface {
 
 	doLoad() ([]byte, error)
 
-	doNewSession(sinfo []byte) error
+	doNewSession(sinfo []byte, update bool) error
 	doRefreshSession() error
 	doFindStaleSessions(limit int) ([]uint64, error) // limit < 0 means all
 	doCleanStaleSession(sid uint64) error
@@ -80,7 +81,8 @@ type engine interface {
 	doCleanupDetachedNode(ctx Context, detachedNode Ino) syscall.Errno
 
 	doGetQuota(ctx Context, inode Ino) (*Quota, error)
-	doSetQuota(ctx Context, inode Ino, quota *Quota, create bool) error
+	// set quota, return true if there is no quota exists before
+	doSetQuota(ctx Context, inode Ino, quota *Quota) (created bool, err error)
 	doDelQuota(ctx Context, inode Ino) error
 	doLoadQuotas(ctx Context) (map[Ino]*Quota, error)
 	doFlushQuotas(ctx Context, quotas map[Ino]*Quota) error
@@ -111,6 +113,10 @@ type engine interface {
 	scanPendingFiles(Context, pendingFileScan) error
 
 	GetSession(sid uint64, detail bool) (*Session, error)
+
+	doSetFacl(ctx Context, ino Ino, aclType uint8, rule *aclAPI.Rule) syscall.Errno
+	doGetFacl(ctx Context, ino Ino, aclType uint8, aclId uint32, rule *aclAPI.Rule) syscall.Errno
+	cacheACLs(ctx Context) error
 }
 
 type trashSliceScan func(ss []Slice, ts int64) (clean bool, err error)
@@ -161,6 +167,7 @@ type baseMeta struct {
 	reloadCb     []func(*Format)
 	umounting    bool
 	sesMu        sync.Mutex
+	aclCache     aclAPI.Cache
 
 	dirStatsLock sync.Mutex
 	dirStats     map[Ino]dirStat
@@ -188,6 +195,7 @@ func newBaseMeta(addr string, conf *Config) *baseMeta {
 	return &baseMeta{
 		addr:         utils.RemovePassword(addr),
 		conf:         conf,
+		sid:          conf.Sid,
 		root:         RootInode,
 		of:           newOpenFiles(conf.OpenCache, conf.OpenCacheLimit),
 		removedFiles: make(map[Ino]bool),
@@ -201,6 +209,7 @@ func newBaseMeta(addr string, conf *Config) *baseMeta {
 		msgCallbacks: &msgCallbacks{
 			callbacks: make(map[uint32]MsgCallback),
 		},
+		aclCache: aclAPI.NewCache(),
 
 		usedSpaceG: prometheus.NewGauge(prometheus.GaugeOpts{
 			Name: "used_space",
@@ -465,6 +474,7 @@ func (m *baseMeta) newSessionInfo() []byte {
 		HostName:   host,
 		IPAddrs:    addrs,
 		MountPoint: m.conf.MountPoint,
+		MountTime:  time.Now(),
 		ProcessID:  os.Getpid(),
 	})
 	if err != nil {
@@ -475,21 +485,32 @@ func (m *baseMeta) newSessionInfo() []byte {
 
 func (m *baseMeta) NewSession(record bool) error {
 	go m.refresh()
+
+	if err := m.en.cacheACLs(Background); err != nil {
+		return err
+	}
+
 	if m.conf.ReadOnly {
 		logger.Infof("Create read-only session OK with version: %s", version.Version())
 		return nil
 	}
 
 	if record {
-		v, err := m.en.incrCounter("nextSession", 1)
-		if err != nil {
-			return fmt.Errorf("get session ID: %s", err)
+		// use the original sid if it's not 0
+		action := "Update"
+		if m.sid == 0 {
+			v, err := m.en.incrCounter("nextSession", 1)
+			if err != nil {
+				return fmt.Errorf("get session ID: %s", err)
+			}
+			m.sid = uint64(v)
+			m.conf.Sid = m.sid
+			action = "Create"
 		}
-		m.sid = uint64(v)
-		if err = m.en.doNewSession(m.newSessionInfo()); err != nil {
+		if err := m.en.doNewSession(m.newSessionInfo(), action == "Update"); err != nil {
 			return fmt.Errorf("create session: %s", err)
 		}
-		logger.Infof("Create session %d OK with version: %s", m.sid, version.Version())
+		logger.Infof("%s session %d OK with version: %s", action, m.sid, version.Version())
 	}
 
 	m.loadQuotas()
@@ -608,11 +629,16 @@ func (m *baseMeta) CloseSession() error {
 		return nil
 	}
 	m.doFlushDirStat()
+	m.doFlushQuotas()
 	m.sesMu.Lock()
 	m.umounting = true
 	m.sesMu.Unlock()
-	logger.Infof("close session %d: %s", m.sid, m.en.doCleanStaleSession(m.sid))
-	return nil
+	var err error
+	if m.sid > 0 {
+		err = m.en.doCleanStaleSession(m.sid)
+	}
+	logger.Infof("close session %d: %s", m.sid, err)
+	return err
 }
 
 func (m *baseMeta) checkQuota(ctx Context, space, inodes int64, parents ...Ino) syscall.Errno {
@@ -757,45 +783,45 @@ func (m *baseMeta) updateDirQuota(ctx Context, inode Ino, space, inodes int64) {
 }
 
 func (m *baseMeta) flushQuotas() {
-	quotas := make(map[Ino]*Quota)
-	var newSpace, newInodes int64
 	for {
 		time.Sleep(time.Second * 3)
-		if !m.getFormat().DirStats {
-			continue
+		m.doFlushQuotas()
+	}
+}
+
+func (m *baseMeta) doFlushQuotas() {
+	if !m.getFormat().DirStats {
+		return
+	}
+	stageMap := make(map[Ino]*Quota)
+	m.quotaMu.RLock()
+	for ino, q := range m.dirQuotas {
+		newSpace := atomic.LoadInt64(&q.newSpace)
+		newInodes := atomic.LoadInt64(&q.newInodes)
+		if newSpace != 0 || newInodes != 0 {
+			stageMap[ino] = &Quota{newSpace: newSpace, newInodes: newInodes}
 		}
+	}
+	m.quotaMu.RUnlock()
+	if len(stageMap) == 0 {
+		return
+	}
+
+	if err := m.en.doFlushQuotas(Background, stageMap); err != nil {
+		logger.Warnf("Flush quotas: %s", err)
+	} else {
 		m.quotaMu.RLock()
-		for ino, q := range m.dirQuotas {
-			newSpace = atomic.LoadInt64(&q.newSpace)
-			newInodes = atomic.LoadInt64(&q.newInodes)
-			if newSpace != 0 || newInodes != 0 {
-				quotas[ino] = &Quota{newSpace: newSpace, newInodes: newInodes}
+		for ino, snap := range stageMap {
+			q := m.dirQuotas[ino]
+			if q == nil {
+				continue
 			}
+			atomic.AddInt64(&q.newSpace, -snap.newSpace)
+			atomic.AddInt64(&q.UsedSpace, snap.newSpace)
+			atomic.AddInt64(&q.newInodes, -snap.newInodes)
+			atomic.AddInt64(&q.UsedInodes, snap.newInodes)
 		}
 		m.quotaMu.RUnlock()
-		if len(quotas) == 0 {
-			continue
-		}
-
-		if err := m.en.doFlushQuotas(Background, quotas); err != nil {
-			logger.Warnf("Flush quotas: %s", err)
-		} else {
-			m.quotaMu.RLock()
-			for ino, snap := range quotas {
-				q := m.dirQuotas[ino]
-				if q == nil {
-					continue
-				}
-				atomic.AddInt64(&q.newSpace, -snap.newSpace)
-				atomic.AddInt64(&q.UsedSpace, snap.newSpace)
-				atomic.AddInt64(&q.newInodes, -snap.newInodes)
-				atomic.AddInt64(&q.UsedInodes, snap.newInodes)
-			}
-			m.quotaMu.RUnlock()
-		}
-		for ino := range quotas {
-			delete(quotas, ino)
-		}
 	}
 }
 
@@ -823,37 +849,34 @@ func (m *baseMeta) HandleQuota(ctx Context, cmd uint8, dpath string, quotas map[
 				return err
 			}
 		}
-		q, err := m.en.doGetQuota(ctx, inode)
+		quota := quotas[dpath]
+		created, err := m.en.doSetQuota(ctx, inode, &Quota{
+			MaxSpace:   quota.MaxSpace,
+			MaxInodes:  quota.MaxInodes,
+			UsedSpace:  -1,
+			UsedInodes: -1,
+		})
 		if err != nil {
 			return err
 		}
-		quota := quotas[dpath]
-		if q == nil {
+		if created {
+			wrapErr := func(e error) error {
+				return errors.Wrapf(e, "set quota usage for file(%s), please repair it later", dpath)
+			}
 			var sum Summary
 			if st := m.GetSummary(ctx, inode, &sum, true, strict); st != 0 {
-				return st
+				return wrapErr(st)
 			}
-			quota.UsedSpace = int64(sum.Size) - align4K(0)
-			quota.UsedInodes = int64(sum.Dirs+sum.Files) - 1
-			if quota.MaxSpace < 0 {
-				quota.MaxSpace = 0
+			_, err := m.en.doSetQuota(ctx, inode, &Quota{
+				UsedSpace:  int64(sum.Size) - align4K(0),
+				UsedInodes: int64(sum.Dirs+sum.Files) - 1,
+				MaxSpace:   -1,
+				MaxInodes:  -1,
+			})
+			if err != nil {
+				return wrapErr(err)
 			}
-			if quota.MaxInodes < 0 {
-				quota.MaxInodes = 0
-			}
-			return m.en.doSetQuota(ctx, inode, quota, true)
-		} else {
-			quota.UsedSpace, quota.UsedInodes = q.UsedSpace, q.UsedInodes
-			if quota.MaxSpace < 0 {
-				quota.MaxSpace = q.MaxSpace
-			}
-			if quota.MaxInodes < 0 {
-				quota.MaxInodes = q.MaxInodes
-			}
-			if quota.MaxSpace == q.MaxSpace && quota.MaxInodes == q.MaxInodes {
-				return nil // nothing to update
-			}
-			return m.en.doSetQuota(ctx, inode, quota, false)
+			return nil
 		}
 	case QuotaGet:
 		q, err := m.en.doGetQuota(ctx, inode)
@@ -909,7 +932,13 @@ func (m *baseMeta) HandleQuota(ctx Context, cmd uint8, dpath string, quotas map[
 			q.UsedSpace = usedSpace
 			quotas[dpath] = q
 			logger.Info("repairing...")
-			return m.en.doSetQuota(ctx, inode, q, true)
+			_, err = m.en.doSetQuota(ctx, inode, &Quota{
+				MaxInodes:  -1,
+				MaxSpace:   -1,
+				UsedInodes: q.UsedInodes,
+				UsedSpace:  q.UsedSpace,
+			})
+			return err
 		}
 		return fmt.Errorf("quota of %s is inconsistent, please repair it with --repair flag", dpath)
 	default:
@@ -1154,11 +1183,19 @@ func (m *baseMeta) parseAttr(buf []byte, attr *Attr) {
 		attr.Parent = Ino(rb.Get64())
 	}
 	attr.Full = true
+	if rb.Left() >= 8 {
+		attr.AccessACL = rb.Get32()
+		attr.DefaultACL = rb.Get32()
+	}
 	logger.Tracef("attr: %+v -> %+v", buf, attr)
 }
 
 func (m *baseMeta) marshal(attr *Attr) []byte {
-	w := utils.NewBuffer(36 + 24 + 4 + 8)
+	size := uint32(36 + 24 + 4 + 8)
+	if attr.AccessACL|attr.DefaultACL != aclAPI.None {
+		size += 8
+	}
+	w := utils.NewBuffer(size)
 	w.Put8(attr.Flags)
 	w.Put16((uint16(attr.Typ) << 12) | (attr.Mode & 0xfff))
 	w.Put32(attr.Uid)
@@ -1173,6 +1210,10 @@ func (m *baseMeta) marshal(attr *Attr) []byte {
 	w.Put64(attr.Length)
 	w.Put32(attr.Rdev)
 	w.Put64(uint64(attr.Parent))
+	if attr.AccessACL+attr.DefaultACL > 0 {
+		w.Put32(attr.AccessACL)
+		w.Put32(attr.DefaultACL)
+	}
 	logger.Tracef("attr: %+v -> %+v", attr, w.Bytes())
 	return w.Bytes()
 }
@@ -1228,6 +1269,7 @@ func (m *baseMeta) Access(ctx Context, inode Ino, mmask uint8, attr *Attr) sysca
 	if !ctx.CheckPermission() {
 		return 0
 	}
+
 	if attr == nil || !attr.Full {
 		if attr == nil {
 			attr = &Attr{}
@@ -1237,6 +1279,20 @@ func (m *baseMeta) Access(ctx Context, inode Ino, mmask uint8, attr *Attr) sysca
 			return err
 		}
 	}
+
+	// ref: https://github.com/torvalds/linux/blob/e5eb28f6d1afebed4bb7d740a797d0390bd3a357/fs/namei.c#L352-L357
+	// dont check acl if mask is 0
+	if attr.AccessACL != aclAPI.None && (attr.Mode&00070) != 0 {
+		rule := &aclAPI.Rule{}
+		if st := m.en.doGetFacl(ctx, inode, aclAPI.TypeAccess, attr.AccessACL, rule); st != 0 {
+			return st
+		}
+		if rule.CanAccess(ctx.Uid(), ctx.Gids(), attr.Uid, attr.Gid, mmask) {
+			return 0
+		}
+		return syscall.EACCES
+	}
+
 	mode := accessMode(attr, ctx.Uid(), ctx.Gids())
 	if mode&mmask != mmask {
 		logger.Debugf("Access inode %d %o, mode %o, request mode %o", inode, attr.Mode, mode, mmask)
@@ -1322,6 +1378,9 @@ func (m *baseMeta) nextInode() (Ino, error) {
 }
 
 func (m *baseMeta) Mknod(ctx Context, parent Ino, name string, _type uint8, mode, cumask uint16, rdev uint32, path string, inode *Ino, attr *Attr) syscall.Errno {
+	if _type < TypeFile || _type > TypeSocket {
+		return syscall.EINVAL
+	}
 	if isTrash(parent) {
 		return syscall.EPERM
 	}
@@ -1375,6 +1434,14 @@ func (m *baseMeta) Mkdir(ctx Context, parent Ino, name string, mode uint16, cuma
 }
 
 func (m *baseMeta) Symlink(ctx Context, parent Ino, name string, path string, inode *Ino, attr *Attr) syscall.Errno {
+	if len(path) == 0 || len(path) > MaxSymlink {
+		return syscall.EINVAL
+	}
+	for _, c := range path {
+		if c == 0 {
+			return syscall.EINVAL
+		}
+	}
 	// mode of symlink is ignored in POSIX
 	return m.Mknod(ctx, parent, name, TypeSymlink, 0777, 0, 0, path, inode, attr)
 }
@@ -1400,6 +1467,9 @@ func (m *baseMeta) Link(ctx Context, inode, parent Ino, name string, attr *Attr)
 	parent = m.checkRoot(parent)
 	if st := m.GetAttr(ctx, inode, attr); st != 0 {
 		return st
+	}
+	if attr.Typ == TypeDirectory {
+		return syscall.EPERM
 	}
 	if m.checkDirQuota(ctx, parent, align4K(attr.Length), 1) {
 		return syscall.EDQUOT
@@ -1436,7 +1506,14 @@ func (m *baseMeta) ReadLink(ctx Context, inode Ino, path *[]byte) syscall.Errno 
 		return errno(err)
 	}
 	if len(target) == 0 {
-		return syscall.ENOENT
+		var attr Attr
+		if st := m.GetAttr(ctx, inode, &attr); st != 0 {
+			return st
+		}
+		if attr.Typ != TypeSymlink {
+			return syscall.EINVAL
+		}
+		return syscall.EIO
 	}
 	*path = target
 	if noatime {
@@ -1770,6 +1847,11 @@ func (m *baseMeta) SetXattr(ctx Context, inode Ino, name string, value []byte, f
 	if name == "" {
 		return syscall.EINVAL
 	}
+	switch flags {
+	case 0, XattrCreate, XattrReplace:
+	default:
+		return syscall.EINVAL
+	}
 
 	defer m.timeit("SetXattr", time.Now())
 	return m.en.doSetXattr(ctx, m.checkRoot(inode), name, value, flags)
@@ -1901,21 +1983,21 @@ func (m *baseMeta) countDirNlink(ctx Context, inode Ino) (uint32, syscall.Errno)
 	return dirCounter, 0
 }
 
-type metaWalkFunc func(ctx Context, inode Ino, path string, attr *Attr)
+type metaWalkFunc func(ctx Context, inode Ino, p string, attr *Attr)
 
-func (m *baseMeta) walk(ctx Context, inode Ino, path string, attr *Attr, walkFn metaWalkFunc) syscall.Errno {
-	walkFn(ctx, inode, path, attr)
+func (m *baseMeta) walk(ctx Context, inode Ino, p string, attr *Attr, walkFn metaWalkFunc) syscall.Errno {
+	walkFn(ctx, inode, p, attr)
 	var entries []*Entry
 	st := m.en.doReaddir(ctx, inode, 1, &entries, -1)
 	if st != 0 && st != syscall.ENOENT {
-		logger.Errorf("list %s: %s", path, st)
+		logger.Errorf("list %s: %s", p, st)
 		return st
 	}
 	for _, entry := range entries {
 		if !entry.Attr.Full {
 			entry.Attr.Parent = inode
 		}
-		if st := m.walk(ctx, entry.Inode, filepath.Join(path, string(entry.Name)), entry.Attr, walkFn); st != 0 {
+		if st := m.walk(ctx, entry.Inode, path.Join(p, string(entry.Name)), entry.Attr, walkFn); st != 0 {
 			return st
 		}
 	}
@@ -2180,6 +2262,50 @@ func (m *baseMeta) CompactAll(ctx Context, threads int, bar *utils.Bar) syscall.
 		return errno(err)
 	}
 	return 0
+}
+
+func (m *baseMeta) Compact(ctx Context, inode Ino, concurrency int, preFunc, postFunc func()) syscall.Errno {
+	var attr Attr
+	if st := m.GetAttr(ctx, inode, &attr); st != 0 {
+		logger.Errorf("get attr error [inode %v]: %v", inode, st)
+		return st
+	}
+
+	var wg sync.WaitGroup
+	// compact
+	chunkChan := make(chan cchunk, 10000)
+	for i := 0; i < concurrency; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for c := range chunkChan {
+				m.en.compactChunk(c.inode, c.indx, true)
+				postFunc()
+			}
+		}()
+	}
+
+	// scan
+	st := m.walk(ctx, inode, "", &attr, func(ctx Context, fIno Ino, path string, fAttr *Attr) {
+		if fAttr.Typ != TypeFile {
+			return
+		}
+		// calc chunk index in local
+		chunkCnt := uint32((fAttr.Length + ChunkSize - 1) / ChunkSize)
+		for i := uint32(0); i < chunkCnt; i++ {
+			preFunc()
+			chunkChan <- cchunk{inode: fIno, indx: i}
+		}
+	})
+
+	// finish
+	close(chunkChan)
+	wg.Wait()
+
+	if st != 0 {
+		logger.Errorf("walk error [inode %v]: %v", inode, st)
+	}
+	return st
 }
 
 func (m *baseMeta) fileDeleted(opened, force bool, inode Ino, length uint64) {
@@ -2616,7 +2742,7 @@ LOOP:
 	return eno
 }
 
-func (m *baseMeta) mergeAttr(ctx Context, inode Ino, set uint16, cur, attr *Attr, now time.Time) (*Attr, syscall.Errno) {
+func (m *baseMeta) mergeAttr(ctx Context, inode Ino, set uint16, cur, attr *Attr, now time.Time, rule *aclAPI.Rule) (*Attr, syscall.Errno) {
 	dirtyAttr := *cur
 	if (set&(SetAttrUID|SetAttrGID)) != 0 && (set&SetAttrMode) != 0 {
 		attr.Mode |= (cur.Mode & 06000)
@@ -2651,7 +2777,12 @@ func (m *baseMeta) mergeAttr(ctx Context, inode Ino, set uint16, cur, attr *Attr
 				attr.Mode &= 05777
 			}
 		}
-		if attr.Mode != cur.Mode {
+
+		if rule != nil {
+			rule.SetMode(attr.Mode)
+			dirtyAttr.Mode = attr.Mode&07000 | rule.GetMode()
+			changed = true
+		} else if attr.Mode != cur.Mode {
 			if ctx.Uid() != 0 && ctx.Uid() != cur.Uid &&
 				(cur.Mode&01777 != attr.Mode&01777 || attr.Mode&02000 > cur.Mode&02000 || attr.Mode&04000 > cur.Mode&04000) {
 				return nil, syscall.EPERM
@@ -2713,6 +2844,89 @@ func (m *baseMeta) CheckSetAttr(ctx Context, inode Ino, set uint16, attr Attr) s
 	if st := m.en.doGetAttr(ctx, inode, &cur); st != 0 {
 		return st
 	}
-	_, st := m.mergeAttr(ctx, inode, set, &cur, &attr, time.Now())
+	_, st := m.mergeAttr(ctx, inode, set, &cur, &attr, time.Now(), nil)
 	return st
+}
+
+var errACLNotInCache = errors.New("acl not in cache")
+
+func (m *baseMeta) getFaclFromCache(ctx Context, ino Ino, aclType uint8, rule *aclAPI.Rule) error {
+	ino = m.checkRoot(ino)
+	cAttr := &Attr{}
+	if m.conf.OpenCache > 0 && m.of.Check(ino, cAttr) {
+		aclId := getAttrACLId(cAttr, aclType)
+		if aclId == aclAPI.None {
+			return ENOATTR
+		}
+
+		if cRule := m.aclCache.Get(aclId); cRule != nil {
+			*rule = *cRule
+			return nil
+		}
+	}
+	return errACLNotInCache
+}
+
+func setAttrACLId(attr *Attr, aclType uint8, id uint32) {
+	switch aclType {
+	case aclAPI.TypeAccess:
+		attr.AccessACL = id
+	case aclAPI.TypeDefault:
+		attr.DefaultACL = id
+	}
+}
+
+func getAttrACLId(attr *Attr, aclType uint8) uint32 {
+	switch aclType {
+	case aclAPI.TypeAccess:
+		return attr.AccessACL
+	case aclAPI.TypeDefault:
+		return attr.DefaultACL
+	}
+	return aclAPI.None
+}
+
+func setXAttrACL(xattrs *[]byte, accessACL, defaultACL uint32) {
+	if accessACL != aclAPI.None {
+		*xattrs = append(*xattrs, []byte("system.posix_acl_access")...)
+		*xattrs = append(*xattrs, 0)
+	}
+	if defaultACL != aclAPI.None {
+		*xattrs = append(*xattrs, []byte("system.posix_acl_default")...)
+		*xattrs = append(*xattrs, 0)
+	}
+}
+
+func (m *baseMeta) SetFacl(ctx Context, ino Ino, aclType uint8, rule *aclAPI.Rule) syscall.Errno {
+	if aclType != aclAPI.TypeAccess && aclType != aclAPI.TypeDefault {
+		return syscall.EINVAL
+	}
+
+	if !ino.IsNormal() {
+		return syscall.EPERM
+	}
+
+	now := time.Now()
+	defer func() {
+		m.timeit("SetFacl", now)
+		m.of.InvalidateChunk(ino, invalidateAttrOnly)
+	}()
+
+	return m.en.doSetFacl(ctx, ino, aclType, rule)
+}
+
+func (m *baseMeta) GetFacl(ctx Context, ino Ino, aclType uint8, rule *aclAPI.Rule) syscall.Errno {
+	var err error
+	if err = m.getFaclFromCache(ctx, ino, aclType, rule); err == nil {
+		return 0
+	}
+
+	if !errors.Is(err, errACLNotInCache) {
+		return errno(err)
+	}
+
+	now := time.Now()
+	defer m.timeit("GetFacl", now)
+
+	return m.en.doGetFacl(ctx, ino, aclType, aclAPI.None, rule)
 }

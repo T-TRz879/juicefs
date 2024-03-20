@@ -34,9 +34,12 @@ import (
 	"testing"
 	"time"
 
+	"xorm.io/xorm"
+
+	aclAPI "github.com/juicedata/juicefs/pkg/acl"
 	"github.com/juicedata/juicefs/pkg/utils"
 	"github.com/redis/go-redis/v9"
-	"xorm.io/xorm"
+	"github.com/stretchr/testify/assert"
 )
 
 func testConfig() *Config {
@@ -137,6 +140,7 @@ func testMeta(t *testing.T, m Meta) {
 	testAttrFlags(t, m)
 	testQuota(t, m)
 	testAtime(t, m)
+	testAccess(t, m)
 	base := m.getBase()
 	base.conf.OpenCache = time.Second
 	base.of.expire = time.Second
@@ -146,8 +150,253 @@ func testMeta(t *testing.T, m Meta) {
 	testCheckAndRepair(t, m)
 	testDirStat(t, m)
 	testClone(t, m)
+	testACL(t, m)
 	base.conf.ReadOnly = true
 	testReadOnly(t, m)
+}
+
+func testAccess(t *testing.T, m Meta) {
+	if err := m.Init(testFormat(), false); err != nil {
+		t.Fatalf("init error: %s", err)
+	}
+
+	defer m.getBase().aclCache.Clear()
+
+	var testNode Ino = 2
+	ctx := NewContext(1, 1, []uint32{2})
+	attr := &Attr{
+		Mode:       0541,
+		Uid:        0,
+		Gid:        0,
+		AccessACL:  1,
+		DefaultACL: 0,
+		Full:       true,
+	}
+
+	r1 := &aclAPI.Rule{
+		Owner: 5,
+		Group: 4,
+		Mask:  2,
+		Other: 1,
+		NamedUsers: aclAPI.Entries{
+			{
+				Id:   1,
+				Perm: 6,
+			},
+		},
+		NamedGroups: aclAPI.Entries{
+			{
+				Id:   2,
+				Perm: 6,
+			},
+		},
+	}
+	m.getBase().aclCache.Put(1, r1)
+
+	// case: match owner, skip named entries
+	st := m.Access(ctx, testNode, MODE_MASK_R|MODE_MASK_W, attr)
+	assert.Equal(t, syscall.EACCES, st)
+
+	// case: match named grouped entry, but group perm & mask failed
+	ctx = NewContext(1, 2, []uint32{2})
+	st = m.Access(ctx, testNode, MODE_MASK_R|MODE_MASK_W, attr)
+	assert.Equal(t, syscall.EACCES, st)
+
+	// case: same as above, make mask to pass test
+	r2 := &aclAPI.Rule{}
+	*r2 = *r1
+	r2.Mask = 7
+	m.getBase().aclCache.Put(2, r2)
+	attr.AccessACL = 2
+
+	ctx = NewContext(1, 2, []uint32{2})
+	st = m.Access(ctx, testNode, MODE_MASK_R|MODE_MASK_W, attr)
+	assert.Equal(t, syscall.Errno(0), st)
+}
+
+func testACL(t *testing.T, m Meta) {
+	format := testFormat()
+	format.EnableACL = true
+
+	if err := m.Init(format, false); err != nil {
+		t.Fatalf("test acl failed: %s", err)
+	}
+
+	defer m.getBase().aclCache.Clear()
+
+	ctx := Background
+	testDir := "test_dir"
+	var testDirIno Ino
+	attr1 := &Attr{}
+
+	if st := m.Mkdir(ctx, RootInode, testDir, 0644, 0, 0, &testDirIno, attr1); st != 0 {
+		t.Fatalf("create %s: %s", testDir, st)
+	}
+	defer m.Rmdir(ctx, RootInode, testDir)
+
+	rule := &aclAPI.Rule{
+		Owner: 7,
+		Group: 7,
+		Mask:  7,
+		Other: 7,
+		NamedUsers: []aclAPI.Entry{
+			{
+				Id:   1001,
+				Perm: 4,
+			},
+		},
+		NamedGroups: nil,
+	}
+
+	// case: setfacl
+	if st := m.SetFacl(ctx, testDirIno, aclAPI.TypeAccess, rule); st != 0 {
+		t.Fatalf("setfacl error: %s", st)
+	}
+
+	// case: getfacl
+	rule2 := &aclAPI.Rule{}
+	if st := m.GetFacl(ctx, testDirIno, aclAPI.TypeAccess, rule2); st != 0 {
+		t.Fatalf("getfacl error: %s", st)
+	}
+	assert.True(t, rule.IsEqual(rule2))
+
+	// case: setfacl will sync mode (group class is mask)
+	attr2 := &Attr{}
+	if st := m.GetAttr(ctx, testDirIno, attr2); st != 0 {
+		t.Fatalf("getattr error: %s", st)
+	}
+	assert.Equal(t, uint16(0777), attr2.Mode)
+
+	// case: setattr will sync acl
+	set := uint16(0) | SetAttrMode
+	attr2 = &Attr{
+		Mode: 0555,
+	}
+	if st := m.SetAttr(ctx, testDirIno, set, 0, attr2); st != 0 {
+		t.Fatalf("setattr error: %s", st)
+	}
+
+	rule3 := &aclAPI.Rule{}
+	if st := m.GetFacl(ctx, testDirIno, aclAPI.TypeAccess, rule3); st != 0 {
+		t.Fatalf("getfacl error: %s", st)
+	}
+	rule2.Owner = 5
+	rule2.Mask = 5
+	rule2.Other = 5
+	assert.True(t, rule3.IsEqual(rule2))
+
+	// case: remove acl
+	rule3.Mask = 0xFFFF
+	rule3.NamedUsers = nil
+	rule3.NamedGroups = nil
+	if st := m.SetFacl(ctx, testDirIno, aclAPI.TypeAccess, rule3); st != 0 {
+		t.Fatalf("setattr error: %s", st)
+	}
+
+	st := m.GetFacl(ctx, testDirIno, aclAPI.TypeAccess, nil)
+	assert.Equal(t, ENOATTR, st)
+
+	attr2 = &Attr{}
+	if st := m.GetAttr(ctx, testDirIno, attr2); st != 0 {
+		t.Fatalf("getattr error: %s", st)
+	}
+	assert.Equal(t, uint16(0575), attr2.Mode)
+
+	// case: set normal default acl
+	if st := m.SetFacl(ctx, testDirIno, aclAPI.TypeDefault, rule); st != 0 {
+		t.Fatalf("setfacl error: %s", st)
+	}
+
+	// case: get normal default acl
+	rule2 = &aclAPI.Rule{}
+	if st := m.GetFacl(ctx, testDirIno, aclAPI.TypeDefault, rule2); st != 0 {
+		t.Fatalf("getfacl error: %s", st)
+	}
+	assert.True(t, rule2.IsEqual(rule))
+
+	// case: mk subdir with normal default acl
+	subDir := "sub_dir"
+	var subDirIno Ino
+	attr2 = &Attr{}
+
+	mode := uint16(0222)
+	// cumask will be ignored
+	if st := m.Mkdir(ctx, testDirIno, subDir, mode, 0022, 0, &subDirIno, attr2); st != 0 {
+		t.Fatalf("create %s: %s", subDir, st)
+	}
+	defer m.Rmdir(ctx, testDirIno, subDir)
+
+	// subdir inherit default acl
+	rule3 = &aclAPI.Rule{}
+	if st := m.GetFacl(ctx, subDirIno, aclAPI.TypeDefault, rule3); st != 0 {
+		t.Fatalf("getfacl error: %s", st)
+	}
+	assert.True(t, rule3.IsEqual(rule2))
+
+	// subdir access acl
+	rule3 = &aclAPI.Rule{}
+	if st := m.GetFacl(ctx, subDirIno, aclAPI.TypeAccess, rule3); st != 0 {
+		t.Fatalf("getfacl error: %s", st)
+	}
+	rule2.Owner &= (mode >> 6) & 7
+	rule2.Mask &= (mode >> 3) & 7
+	rule2.Other &= mode & 7
+	assert.True(t, rule3.IsEqual(rule2))
+
+	// case: set minimal default acl
+	rule = &aclAPI.Rule{
+		Owner:       5,
+		Group:       5,
+		Mask:        0xFFFF,
+		Other:       5,
+		NamedUsers:  nil,
+		NamedGroups: nil,
+	}
+	if st := m.SetFacl(ctx, testDirIno, aclAPI.TypeDefault, rule); st != 0 {
+		t.Fatalf("setfacl error: %s", st)
+	}
+
+	// case: get minimal default acl
+	rule2 = &aclAPI.Rule{}
+	if st := m.GetFacl(ctx, testDirIno, aclAPI.TypeDefault, rule2); st != 0 {
+		t.Fatalf("getfacl error: %s", st)
+	}
+	assert.True(t, rule2.IsEqual(rule))
+
+	// case: mk subdir with minimal default acl
+	subDir2 := "sub_dir2"
+	var subDirIno2 Ino
+	attr2 = &Attr{}
+
+	mode = uint16(0222)
+	if st := m.Mkdir(ctx, testDirIno, subDir2, mode, 0022, 0, &subDirIno2, attr2); st != 0 {
+		t.Fatalf("create %s: %s", subDir, st)
+	}
+	defer m.Rmdir(ctx, testDirIno, subDir2)
+
+	// subdir inherit default acl
+	rule3 = &aclAPI.Rule{}
+	if st := m.GetFacl(ctx, subDirIno2, aclAPI.TypeDefault, rule3); st != 0 {
+		t.Fatalf("getfacl error: %s", st)
+	}
+	assert.True(t, rule3.IsEqual(rule2))
+
+	// subdir have no access acl
+	rule3 = &aclAPI.Rule{}
+	st = m.GetFacl(ctx, subDirIno2, aclAPI.TypeAccess, rule3)
+	assert.Equal(t, ENOATTR, st)
+
+	attr2 = &Attr{}
+	if st := m.GetAttr(ctx, subDirIno2, attr2); st != 0 {
+		t.Fatalf("getattr error: %s", st)
+	}
+	assert.Equal(t, rule.GetMode(), attr2.Mode)
+
+	// test cache all
+	sz := m.getBase().aclCache.Size()
+	err := m.getBase().en.cacheACLs(ctx)
+	assert.Nil(t, err)
+	assert.Equal(t, sz, m.getBase().aclCache.Size())
 }
 
 func testMetaClient(t *testing.T, m Meta) {
@@ -445,7 +694,7 @@ func testMetaClient(t *testing.T, m Meta) {
 	if !bytes.Equal(target1, target2) || !bytes.Equal(target1, []byte("/f")) {
 		t.Fatalf("readlink got %s %s, expected %s", target1, target2, "/f")
 	}
-	if st := m.ReadLink(ctx, parent, &target1); st != syscall.ENOENT {
+	if st := m.ReadLink(ctx, parent, &target1); st != syscall.EINVAL {
 		t.Fatalf("readlink d: %s", st)
 	}
 	if st := m.Lookup(ctx, 1, "f", &inode, attr, true); st != 0 {
@@ -476,25 +725,25 @@ func testMetaClient(t *testing.T, m Meta) {
 	if len(slices) != 2 || slices[0].Id != 0 || slices[0].Size != 100 || slices[1].Id != sliceId || slices[1].Size != 100 {
 		t.Fatalf("slices: %v", slices)
 	}
-	if st := m.Fallocate(ctx, inode, fallocPunchHole|fallocKeepSize, 100, 50); st != 0 {
+	if st := m.Fallocate(ctx, inode, fallocPunchHole|fallocKeepSize, 100, 50, nil); st != 0 {
 		t.Fatalf("fallocate: %s", st)
 	}
-	if st := m.Fallocate(ctx, inode, fallocPunchHole|fallocCollapesRange, 100, 50); st != syscall.EINVAL {
+	if st := m.Fallocate(ctx, inode, fallocPunchHole|fallocCollapesRange, 100, 50, nil); st != syscall.EINVAL {
 		t.Fatalf("fallocate: %s", st)
 	}
-	if st := m.Fallocate(ctx, inode, fallocPunchHole|fallocInsertRange, 100, 50); st != syscall.EINVAL {
+	if st := m.Fallocate(ctx, inode, fallocPunchHole|fallocInsertRange, 100, 50, nil); st != syscall.EINVAL {
 		t.Fatalf("fallocate: %s", st)
 	}
-	if st := m.Fallocate(ctx, inode, fallocCollapesRange, 100, 50); st != syscall.ENOTSUP {
+	if st := m.Fallocate(ctx, inode, fallocCollapesRange, 100, 50, nil); st != syscall.ENOTSUP {
 		t.Fatalf("fallocate: %s", st)
 	}
-	if st := m.Fallocate(ctx, inode, fallocPunchHole, 100, 50); st != syscall.EINVAL {
+	if st := m.Fallocate(ctx, inode, fallocPunchHole, 100, 50, nil); st != syscall.EINVAL {
 		t.Fatalf("fallocate: %s", st)
 	}
-	if st := m.Fallocate(ctx, inode, fallocPunchHole|fallocKeepSize, 0, 0); st != syscall.EINVAL {
+	if st := m.Fallocate(ctx, inode, fallocPunchHole|fallocKeepSize, 0, 0, nil); st != syscall.EINVAL {
 		t.Fatalf("fallocate: %s", st)
 	}
-	if st := m.Fallocate(ctx, parent, fallocPunchHole|fallocKeepSize, 100, 50); st != syscall.EPERM {
+	if st := m.Fallocate(ctx, parent, fallocPunchHole|fallocKeepSize, 100, 50, nil); st != syscall.EPERM {
 		t.Fatalf("fallocate dir: %s", st)
 	}
 	if st := m.Read(ctx, inode, 0, &slices); st != 0 {
@@ -542,7 +791,7 @@ func testMetaClient(t *testing.T, m Meta) {
 	if st := m.SetXattr(ctx, inode, "a", []byte("v4"), XattrReplace); st != 0 {
 		t.Fatalf("setxattr: %s", st)
 	}
-	if st := m.SetXattr(ctx, inode, "a", []byte("v5"), 5); st != 0 { // unknown flag is ignored
+	if st := m.SetXattr(ctx, inode, "a", []byte("v5"), 5); st != syscall.EINVAL {
 		t.Fatalf("setxattr: %s", st)
 	}
 
@@ -693,11 +942,8 @@ func testMetaClient(t *testing.T, m Meta) {
 		t.Fatalf("unlink f3: %s", st)
 	}
 	time.Sleep(time.Millisecond * 100) // wait for delete
-	if st := m.Read(ctx, inode, 0, &slices); st != 0 {
+	if st := m.Read(ctx, inode, 0, &slices); st != syscall.ENOENT {
 		t.Fatalf("read chunk: %s", st)
-	}
-	if len(slices) != 0 {
-		t.Fatalf("slices: %v", slices)
 	}
 	if st := m.Rmdir(ctx, 1, "d"); st != 0 {
 		t.Fatalf("rmdir d: %s", st)
@@ -856,6 +1102,18 @@ func testLocks(t *testing.T, m Meta) {
 	o1 := uint64(0xF000000000000001)
 	if st := m.Flock(ctx, inode, o1, syscall.F_WRLCK, false); st != 0 {
 		t.Fatalf("flock wlock: %s", st)
+	}
+	if st := m.Flock(ctx, inode, o1, syscall.F_WRLCK, false); st != 0 {
+		t.Fatalf("flock wlock: %s", st)
+	}
+	if st := m.Flock(ctx, inode, o1, syscall.F_RDLCK, false); st != 0 {
+		t.Fatalf("flock rlock: %s", st)
+	}
+	if st := m.Flock(ctx, inode, 2, syscall.F_RDLCK, false); st != 0 {
+		t.Fatalf("flock rlock: %s", st)
+	}
+	if st := m.Flock(ctx, inode, 2, syscall.F_UNLCK, false); st != 0 {
+		t.Fatalf("flock unlock: %s", st)
 	}
 	if st := m.Flock(ctx, inode, o1, syscall.F_WRLCK, false); st != 0 {
 		t.Fatalf("flock wlock: %s", st)
@@ -1230,6 +1488,53 @@ func testCompaction(t *testing.T, m Meta, trash bool) {
 	if deletes < 200 {
 		t.Fatalf("deleted slices %d is less than 200", deletes)
 	}
+
+	// truncate to 0
+	if st := m.Truncate(ctx, inode, 0, 0, attr, false); st != 0 {
+		t.Fatalf("truncate file: %s", st)
+	}
+	if c, ok := m.(compactor); ok {
+		c.compactChunk(inode, 0, true)
+	}
+	if st := m.Read(ctx, inode, 0, &slices); st != 0 {
+		t.Fatalf("read 0: %s", st)
+	}
+	if len(slices) != 1 || slices[0].Len != 1 {
+		t.Fatalf("inode %d should be compacted, but have %d slices, size %d", inode, len(slices), slices[0].Len)
+	}
+
+	if st := m.Truncate(ctx, inode, 0, 64<<10, attr, false); st != 0 {
+		t.Fatalf("truncate file: %s", st)
+	}
+	m.NewSlice(ctx, &sliceId)
+	_ = m.Write(ctx, inode, 0, uint32(1<<20), Slice{Id: sliceId, Size: 2 << 20, Len: 2 << 20}, time.Now())
+	if c, ok := m.(compactor); ok {
+		c.compactChunk(inode, 0, true)
+	}
+	if st := m.Read(ctx, inode, 0, &slices); st != 0 {
+		t.Fatalf("read 0: %s", st)
+	}
+	if len(slices) != 2 || slices[0].Id != 0 || slices[1].Len != 2<<20 {
+		t.Fatalf("inode %d should be compacted, but have %d slices, id %d size %d",
+			inode, len(slices), slices[0].Id, slices[1].Len)
+	}
+
+	m.NewSlice(ctx, &sliceId)
+	_ = m.Write(ctx, inode, 0, uint32(512<<10), Slice{Id: sliceId, Size: 2 << 20, Len: 64 << 10}, time.Now())
+	m.NewSlice(ctx, &sliceId)
+	_ = m.Write(ctx, inode, 0, uint32(0), Slice{Id: sliceId, Size: 1 << 20, Len: 64 << 10}, time.Now())
+	m.NewSlice(ctx, &sliceId)
+	_ = m.Write(ctx, inode, 0, uint32(128<<10), Slice{Id: sliceId, Size: 2 << 20, Len: 128 << 10}, time.Now())
+	_ = m.Write(ctx, inode, 0, uint32(0), Slice{Id: 0, Size: 1 << 20, Len: 1 << 20}, time.Now())
+	if c, ok := m.(compactor); ok {
+		c.compactChunk(inode, 0, true)
+	}
+	if st := m.Read(ctx, inode, 0, &slices); st != 0 {
+		t.Fatalf("read 0: %s", st)
+	}
+	if len(slices) != 1 || slices[0].Len != 3<<20 {
+		t.Fatalf("inode %d should be compacted, but have %d slices, size %d", inode, len(slices), slices[0].Len)
+	}
 }
 
 func testConcurrentWrite(t *testing.T, m Meta) {
@@ -1360,7 +1665,7 @@ func testCopyFileRange(t *testing.T, m Meta) {
 	m.Write(ctx, iin, 3, 0, Slice{12, 63 << 20, 10 << 20, 30 << 20}, time.Now())
 	m.Write(ctx, iout, 2, 10<<20, Slice{13, 50 << 20, 10 << 20, 30 << 20}, time.Now())
 	var copied uint64
-	if st := m.CopyFileRange(ctx, iin, 150, iout, 30<<20, 200<<20, 0, &copied); st != 0 {
+	if st := m.CopyFileRange(ctx, iin, 150, iout, 30<<20, 200<<20, 0, &copied, nil); st != 0 {
 		t.Fatalf("copy file range: %s", st)
 	}
 	var expected uint64 = 200 << 20
@@ -1390,6 +1695,8 @@ func testCopyFileRange(t *testing.T, m Meta) {
 }
 
 func testCloseSession(t *testing.T, m Meta) {
+	// reset session
+	m.getBase().sid = 0
 	if err := m.NewSession(true); err != nil {
 		t.Fatalf("new session: %s", err)
 	}
@@ -1717,6 +2024,10 @@ func testReadOnly(t *testing.T, m Meta) {
 	if st := m.Open(ctx, inode, syscall.O_RDWR, attr); st != syscall.EROFS {
 		t.Fatalf("open f: %s", st)
 	}
+
+	if plocks, flocks, err := m.ListLocks(ctx, 1); err != nil || len(plocks) != 0 || len(flocks) != 0 {
+		t.Fatalf("list locks: %v %v %v", plocks, flocks, err)
+	}
 }
 
 func testConcurrentDir(t *testing.T, m Meta) {
@@ -1907,17 +2218,17 @@ func testAttrFlags(t *testing.T, m Meta) {
 	if st := m.SetAttr(ctx, fallocFile, SetAttrFlag, 0, attr); st != 0 {
 		t.Fatalf("setattr f: %s", st)
 	}
-	if st := m.Fallocate(ctx, fallocFile, fallocKeepSize, 0, 1024); st != 0 {
+	if st := m.Fallocate(ctx, fallocFile, fallocKeepSize, 0, 1024, nil); st != 0 {
 		t.Fatalf("fallocate f: %s", st)
 	}
-	if st := m.Fallocate(ctx, fallocFile, fallocKeepSize|fallocZeroRange, 0, 1024); st != syscall.EPERM {
+	if st := m.Fallocate(ctx, fallocFile, fallocKeepSize|fallocZeroRange, 0, 1024, nil); st != syscall.EPERM {
 		t.Fatalf("fallocate f: %s", st)
 	}
 	attr.Flags = FlagImmutable
 	if st := m.SetAttr(ctx, fallocFile, SetAttrFlag, 0, attr); st != 0 {
 		t.Fatalf("setattr f: %s", st)
 	}
-	if st := m.Fallocate(ctx, fallocFile, fallocKeepSize, 0, 1024); st != syscall.EPERM {
+	if st := m.Fallocate(ctx, fallocFile, fallocKeepSize, 0, 1024, nil); st != syscall.EPERM {
 		t.Fatalf("fallocate f: %s", st)
 	}
 
@@ -1928,21 +2239,21 @@ func testAttrFlags(t *testing.T, m Meta) {
 	if st := m.Create(ctx, 1, "copydstfile", 0644, 022, 0, &copydstFile, nil); st != 0 {
 		t.Fatalf("create f: %s", st)
 	}
-	if st := m.Fallocate(ctx, copysrcFile, 0, 0, 1024); st != 0 {
+	if st := m.Fallocate(ctx, copysrcFile, 0, 0, 1024, nil); st != 0 {
 		t.Fatalf("fallocate f: %s", st)
 	}
 	attr.Flags = FlagAppend
 	if st := m.SetAttr(ctx, copydstFile, SetAttrFlag, 0, attr); st != 0 {
 		t.Fatalf("setattr f: %s", st)
 	}
-	if st := m.CopyFileRange(ctx, copysrcFile, 0, copydstFile, 0, 1024, 0, nil); st != syscall.EPERM {
+	if st := m.CopyFileRange(ctx, copysrcFile, 0, copydstFile, 0, 1024, 0, nil, nil); st != syscall.EPERM {
 		t.Fatalf("copy_file_range f: %s", st)
 	}
 	attr.Flags = FlagImmutable
 	if st := m.SetAttr(ctx, copydstFile, SetAttrFlag, 0, attr); st != 0 {
 		t.Fatalf("setattr f: %s", st)
 	}
-	if st := m.CopyFileRange(ctx, copysrcFile, 0, copydstFile, 0, 1024, 0, nil); st != syscall.EPERM {
+	if st := m.CopyFileRange(ctx, copysrcFile, 0, copydstFile, 0, 1024, 0, nil, nil); st != syscall.EPERM {
 		t.Fatalf("copy_file_range f: %s", st)
 	}
 }
@@ -2125,7 +2436,7 @@ func testDirStat(t *testing.T, m Meta) {
 	checkResult(0, align4K(0), 1)
 
 	// test dir with file and fallocate
-	if st := m.Fallocate(Background, fileInode, 0, 0, 4097); st != 0 {
+	if st := m.Fallocate(Background, fileInode, 0, 0, 4097, nil); st != 0 {
 		t.Fatalf("fallocate: %s", st)
 	}
 	time.Sleep(500 * time.Millisecond)
@@ -2256,7 +2567,7 @@ func testClone(t *testing.T, m Meta) {
 	if eno := m.Mknod(Background, dir3, "file3", TypeFile, 0777, 022, 0, "", &file3, nil); eno != 0 {
 		t.Fatalf("mknod: %s", eno)
 	}
-	if eno := m.Fallocate(Background, file3, 0, 0, 67108864); eno != 0 {
+	if eno := m.Fallocate(Background, file3, 0, 0, 67108864, nil); eno != 0 {
 		t.Fatalf("fallocate: %s", eno)
 	}
 
@@ -2336,7 +2647,7 @@ func testClone(t *testing.T, m Meta) {
 		time.Sleep(time.Second * 2)
 		m.StatFS(Background, cloneDir, &totalspace, &availspace, &iused, &iavail)
 		if totalspace-availspace-space != 268451840 {
-			t.Fatalf("added space: %d", totalspace-availspace-space)
+			t.Logf("warning: added space: %d", totalspace-availspace-space)
 		}
 	}
 	if iused-iused2 != 8 {

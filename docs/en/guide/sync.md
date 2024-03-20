@@ -107,6 +107,24 @@ The following command synchronizes all of the data on [Object Storage A](#requir
 juicefs sync s3://ABCDEFG:HIJKLMN@aaa.s3.us-west-1.amazonaws.com oss://ABCDEFG:HIJKLMN@bbb.oss-cn-hangzhou.aliyuncs.com
 ```
 
+### Synchronize between Local and Remote Servers
+
+To copy files between directories on a local computer, simply specify the source and destination paths. For example, to synchronize the `/media/` directory with the `/backup/` directory:
+
+```shell
+juicefs sync /media/ /backup/
+```
+
+If you need to synchronize between servers, you can access the target server using the SFTP/SSH protocol. For example, to synchronize the local `/media/` directory with the `/backup/` directory on another server:
+
+```shell
+juicefs sync /media/ username@192.168.1.100:/backup/
+# Specify password (optional)
+juicefs sync /media/ "username:password"@192.168.1.100:/backup/
+```
+
+When using the SFTP/SSH protocol, if no password is specified, the sync task will prompt for the password. If you want to explicitly specify the username and password, you need to enclose them in double quotation marks, with a colon separating the username and password.
+
 ### Sync Without Mount Point <VersionAdd>1.1</VersionAdd>
 
 For data migrations that involve JuiceFS, it's recommended use the `jfs://` protocol, rather than mount JuiceFS and access its local directory, which bypasses the FUSE mount point and access JuiceFS directly. Under large scale scenarios, bypassing FUSE can save precious resources and increase performance.
@@ -264,3 +282,15 @@ juicefs sync cos://ABCDEFG:HIJKLMN@ccc-125000.cos.ap-beijing.myqcloud.com oss://
 ```
 
 After sync, the file content and hierarchy in the [Object Storage B](#required-storages) are exactly the same as the [underlying object storage of JuiceFS](#required-storages).
+
+### Sync across regions using S3 Gateway {#sync-across-region}
+
+When transferring a large amount of small files across different regions via FUSE mount points, clients will inevitably talk to the metadata service in the opposite region via public internet (or dedicated network connection with limited bandwidth). In such cases, metadata latency can become the bottleneck of the data transfer:
+
+![sync via public metadata service](../images/sync-public-metadata.svg)
+
+S3 Gateway comes to rescue in these circumstances: deploy a gateway in the source region, and since this gateway accesses metadata via private network, metadata latency is eliminated to a minimum, bringing the best performance for small file intensive scenarios.
+
+![sync via gateway](../images/sync-via-gateway.svg)
+
+Read [S3 Gateway](../deployment/s3_gateway.md) to learn its deployment and use.

@@ -28,6 +28,7 @@ import (
 	"io"
 	"net/url"
 	"runtime"
+	"runtime/debug"
 	"sort"
 	"strings"
 	"sync"
@@ -35,15 +36,17 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/juicedata/juicefs/pkg/utils"
-	"github.com/pkg/errors"
-	"github.com/sirupsen/logrus"
 	"xorm.io/xorm"
 	"xorm.io/xorm/log"
 	"xorm.io/xorm/names"
+
+	aclAPI "github.com/juicedata/juicefs/pkg/acl"
+	"github.com/juicedata/juicefs/pkg/utils"
+	"github.com/pkg/errors"
+	"github.com/sirupsen/logrus"
 )
 
-const MaxFieldsCountOfTable = 16 // node table
+const MaxFieldsCountOfTable = 18 // node table
 
 type setting struct {
 	Name  string `xorm:"pk"`
@@ -64,22 +67,67 @@ type edge struct {
 }
 
 type node struct {
-	Inode     Ino    `xorm:"pk"`
-	Type      uint8  `xorm:"notnull"`
-	Flags     uint8  `xorm:"notnull"`
-	Mode      uint16 `xorm:"notnull"`
-	Uid       uint32 `xorm:"notnull"`
-	Gid       uint32 `xorm:"notnull"`
-	Atime     int64  `xorm:"notnull"`
-	Mtime     int64  `xorm:"notnull"`
-	Ctime     int64  `xorm:"notnull"`
-	Atimensec int16  `xorm:"notnull default 0"`
-	Mtimensec int16  `xorm:"notnull default 0"`
-	Ctimensec int16  `xorm:"notnull default 0"`
-	Nlink     uint32 `xorm:"notnull"`
-	Length    uint64 `xorm:"notnull"`
-	Rdev      uint32
-	Parent    Ino
+	Inode        Ino    `xorm:"pk"`
+	Type         uint8  `xorm:"notnull"`
+	Flags        uint8  `xorm:"notnull"`
+	Mode         uint16 `xorm:"notnull"`
+	Uid          uint32 `xorm:"notnull"`
+	Gid          uint32 `xorm:"notnull"`
+	Atime        int64  `xorm:"notnull"`
+	Mtime        int64  `xorm:"notnull"`
+	Ctime        int64  `xorm:"notnull"`
+	Atimensec    int16  `xorm:"notnull default 0"`
+	Mtimensec    int16  `xorm:"notnull default 0"`
+	Ctimensec    int16  `xorm:"notnull default 0"`
+	Nlink        uint32 `xorm:"notnull"`
+	Length       uint64 `xorm:"notnull"`
+	Rdev         uint32
+	Parent       Ino
+	AccessACLId  uint32 `xorm:"'access_acl_id'"`
+	DefaultACLId uint32 `xorm:"'default_acl_id'"`
+}
+
+func getACLIdColName(aclType uint8) string {
+	switch aclType {
+	case aclAPI.TypeAccess:
+		return "access_acl_id"
+	case aclAPI.TypeDefault:
+		return "default_acl_id"
+	}
+	return ""
+}
+
+type acl struct {
+	Id          uint32 `xorm:"pk autoincr"`
+	Owner       uint16
+	Group       uint16
+	Mask        uint16
+	Other       uint16
+	NamedUsers  []byte
+	NamedGroups []byte
+}
+
+func newSQLAcl(r *aclAPI.Rule) *acl {
+	a := &acl{
+		Owner: r.Owner,
+		Group: r.Group,
+		Mask:  r.Mask,
+		Other: r.Other,
+	}
+	a.NamedUsers = r.NamedUsers.Encode()
+	a.NamedGroups = r.NamedGroups.Encode()
+	return a
+}
+
+func (a *acl) toRule() *aclAPI.Rule {
+	r := &aclAPI.Rule{}
+	r.Owner = a.Owner
+	r.Group = a.Group
+	r.Other = a.Other
+	r.Mask = a.Mask
+	r.NamedUsers.Decode(a.NamedUsers)
+	r.NamedGroups.Decode(a.NamedGroups)
+	return r
 }
 
 type namedNode struct {
@@ -190,12 +238,29 @@ type dbMeta struct {
 	noReadOnlyTxn bool
 }
 
+var _ Meta = &dbMeta{}
+var _ engine = &dbMeta{}
+
 type dbSnap struct {
 	node    map[Ino]*node
 	symlink map[Ino]*symlink
 	xattr   map[Ino][]*xattr
 	edges   map[Ino][]*edge
 	chunk   map[string]*chunk
+}
+
+func recoveryMysqlPwd(addr string) string {
+	colonIndex := strings.Index(addr, ":")
+	atIndex := strings.LastIndex(addr, "@")
+	if colonIndex != -1 && colonIndex < atIndex {
+		pwd := addr[colonIndex+1 : atIndex]
+		if parse, err := url.Parse("mysql://root:" + pwd + "@127.0.0.1"); err == nil {
+			if originPwd, ok := parse.User.Password(); ok {
+				addr = fmt.Sprintf("%s:%s%s", addr[:colonIndex], originPwd, addr[atIndex:])
+			}
+		}
+	}
+	return addr
 }
 
 func newSQLMeta(driver, addr string, conf *Config) (Meta, error) {
@@ -215,6 +280,12 @@ func newSQLMeta(driver, addr string, conf *Config) (Meta, error) {
 			}
 		}
 	}
+
+	// escaping is not necessary for mysql password https://github.com/go-sql-driver/mysql#password
+	if driver == "mysql" {
+		addr = recoveryMysqlPwd(addr)
+	}
+
 	engine, err := xorm.NewEngine(driver, addr)
 	if err != nil {
 		return nil, fmt.Errorf("unable to use data source %s: %s", driver, err)
@@ -305,6 +376,9 @@ func (m *dbMeta) doInit(format *Format, force bool) error {
 	if err := m.syncTable(new(detachedNode)); err != nil {
 		return fmt.Errorf("create table detachedNode: %s", err)
 	}
+	if err := m.syncTable(new(acl)); err != nil {
+		return fmt.Errorf("create table acl: %s", err)
+	}
 
 	var s = setting{Name: "format"}
 	var ok bool
@@ -393,12 +467,25 @@ func (m *dbMeta) doInit(format *Format, force bool) error {
 	})
 }
 
+func (m *dbMeta) cacheACLs(ctx Context) error {
+	if !m.getFormat().EnableACL {
+		return nil
+	}
+	return m.roTxn(func(s *xorm.Session) error {
+		return s.Table(&acl{}).Iterate(new(acl), func(idx int, bean interface{}) error {
+			a := bean.(*acl)
+			m.aclCache.Put(a.Id, a.toRule())
+			return nil
+		})
+	})
+}
+
 func (m *dbMeta) Reset() error {
 	return m.db.DropTables(&setting{}, &counter{},
 		&node{}, &edge{}, &symlink{}, &xattr{},
 		&chunk{}, &sliceRef{}, &delslices{},
 		&session{}, &session2{}, &sustained{}, &delfile{},
-		&flock{}, &plock{}, &dirStats{}, &dirQuota{}, &detachedNode{})
+		&flock{}, &plock{}, &dirStats{}, &dirQuota{}, &detachedNode{}, &acl{})
 }
 
 func (m *dbMeta) doLoad() (data []byte, err error) {
@@ -418,9 +505,9 @@ func (m *dbMeta) doLoad() (data []byte, err error) {
 	return
 }
 
-func (m *dbMeta) doNewSession(sinfo []byte) error {
+func (m *dbMeta) doNewSession(sinfo []byte, update bool) error {
 	// add new table
-	err := m.syncTable(new(session2), new(delslices), new(dirStats), new(detachedNode), new(dirQuota))
+	err := m.syncTable(new(session2), new(delslices), new(dirStats), new(detachedNode), new(dirQuota), new(acl))
 	if err != nil {
 		return fmt.Errorf("update table session2, delslices, dirstats, detachedNode, dirQuota: %s", err)
 	}
@@ -438,21 +525,30 @@ func (m *dbMeta) doNewSession(sinfo []byte) error {
 	}
 
 	for {
-		if err = m.txn(func(s *xorm.Session) error {
-			return mustInsert(s, &session2{m.sid, m.expireTime(), sinfo})
-		}); err == nil {
-			break
-		}
-		if isDuplicateEntryErr(err) {
-			logger.Warnf("session id %d is already used", m.sid)
-			if v, e := m.incrCounter("nextSession", 1); e == nil {
-				m.sid = uint64(v)
-				continue
-			} else {
-				return fmt.Errorf("get session ID: %s", e)
-			}
+		beans := session2{Sid: m.sid, Expire: m.expireTime(), Info: sinfo}
+		if update {
+			return m.txn(func(s *xorm.Session) error {
+				_, err = s.Cols("expire", "info").Update(&beans, &session2{Sid: beans.Sid})
+				return err
+			})
 		} else {
-			return fmt.Errorf("insert new session %d: %s", m.sid, err)
+			if err = m.txn(func(s *xorm.Session) error {
+				return mustInsert(s, &beans)
+			}); err == nil {
+				break
+			}
+
+			if isDuplicateEntryErr(err) {
+				logger.Warnf("session id %d is already used", m.sid)
+				if v, e := m.incrCounter("nextSession", 1); e == nil {
+					m.sid = uint64(v)
+					continue
+				} else {
+					return fmt.Errorf("get session ID: %s", e)
+				}
+			} else {
+				return fmt.Errorf("insert new session %d: %s", m.sid, err)
+			}
 		}
 	}
 	return nil
@@ -793,6 +889,8 @@ func (m *dbMeta) parseAttr(n *node, attr *Attr) {
 	attr.Rdev = n.Rdev
 	attr.Parent = n.Parent
 	attr.Full = true
+	attr.AccessACL = n.AccessACLId
+	attr.DefaultACL = n.DefaultACLId
 }
 
 func (m *dbMeta) parseNode(attr *Attr, n *node) {
@@ -814,6 +912,8 @@ func (m *dbMeta) parseNode(attr *Attr, n *node) {
 	n.Length = attr.Length
 	n.Rdev = attr.Rdev
 	n.Parent = attr.Parent
+	n.AccessACLId = attr.AccessACL
+	n.DefaultACLId = attr.DefaultACL
 }
 
 func (m *dbMeta) updateStats(space int64, inodes int64) {
@@ -876,12 +976,21 @@ func (m *dbMeta) doGetAttr(ctx Context, inode Ino, attr *Attr) syscall.Errno {
 	return errno(m.roTxn(func(s *xorm.Session) error {
 		var n = node{Inode: inode}
 		ok, err := s.Get(&n)
-		if ok {
-			m.parseAttr(&n, attr)
-		} else if err == nil {
-			err = syscall.ENOENT
+		if err != nil {
+			return err
+		} else if !ok {
+			return syscall.ENOENT
 		}
-		return err
+		m.parseAttr(&n, attr)
+
+		if attr != nil && attr.AccessACL != aclAPI.None {
+			rule, err := m.getACL(s, attr.AccessACL)
+			if err != nil {
+				return err
+			}
+			attr.Mode = (rule.GetMode() & 0777) | (attr.Mode & 07000)
+		}
+		return nil
 	}))
 }
 
@@ -901,18 +1010,45 @@ func (m *dbMeta) doSetAttr(ctx Context, inode Ino, set uint16, sugidclearmode ui
 			return syscall.EPERM
 		}
 		now := time.Now()
-		dirtyAttr, st := m.mergeAttr(ctx, inode, set, &curAttr, attr, now)
+
+		// get acl
+		var rule *aclAPI.Rule
+		if curAttr.AccessACL != aclAPI.None {
+			oldRule, err := m.getACL(s, curAttr.AccessACL)
+			if err != nil {
+				return err
+			}
+			rule = &aclAPI.Rule{}
+			*rule = *oldRule
+		}
+
+		dirtyAttr, st := m.mergeAttr(ctx, inode, set, &curAttr, attr, now, rule)
 		if st != 0 {
 			return st
 		}
 		if dirtyAttr == nil {
 			return nil
 		}
+
+		// set acl
+		if rule != nil {
+			if err = m.tryLoadMissACLs(s); err != nil {
+				logger.Warnf("SetAttr: load miss acls error: %s", err)
+			}
+
+			aclId, err := m.insertACL(s, rule)
+			if err != nil {
+				return err
+			}
+			setAttrACLId(dirtyAttr, aclAPI.TypeAccess, aclId)
+		}
+
 		var dirtyNode node
 		m.parseNode(dirtyAttr, &dirtyNode)
 		dirtyNode.Ctime = now.UnixNano() / 1e3
 		dirtyNode.Ctimensec = int16(now.Nanosecond() % 1000)
-		_, err = s.Cols("flags", "mode", "uid", "gid", "atime", "mtime", "ctime", "atimensec", "mtimensec", "ctimensec").
+		_, err = s.Cols("flags", "mode", "uid", "gid", "atime", "mtime", "ctime",
+			"atimensec", "mtimensec", "ctimensec", "access_acl_id", "default_acl_id").
 			Update(&dirtyNode, &node{Inode: inode})
 		if err == nil {
 			m.parseAttr(&dirtyNode, attr)
@@ -934,6 +1070,28 @@ func (m *dbMeta) appendSlice(s *xorm.Session, inode Ino, indx uint32, buf []byte
 		if n, _ := r.RowsAffected(); n == 0 {
 			err = mustInsert(s, &chunk{Inode: inode, Indx: indx, Slices: buf})
 		}
+	}
+	return err
+}
+
+func (m *dbMeta) upsertSlice(s *xorm.Session, inode Ino, indx uint32, buf []byte, insert *bool) error {
+	var err error
+	driver := m.Name()
+	if driver == "sqlite3" || driver == "postgres" {
+		_, err = s.Exec(`
+		INSERT INTO jfs_chunk (inode, indx, slices)
+		VALUES (?, ?, ?)
+		ON CONFLICT (inode, indx)
+		DO UPDATE SET slices=jfs_chunk.slices || ?`, inode, indx, buf, buf)
+	} else {
+		var r sql.Result
+		r, err = s.Exec(`
+		INSERT INTO jfs_chunk (inode, indx, slices)
+		VALUES (?, ?, ?)
+		ON DUPLICATE KEY UPDATE
+		slices=concat(slices, ?)`, inode, indx, buf, buf)
+		n, _ := r.RowsAffected()
+		*insert = n == 1 // https://dev.mysql.com/doc/refman/5.7/en/insert-on-duplicate.html
 	}
 	return err
 }
@@ -1026,7 +1184,7 @@ func (m *dbMeta) Truncate(ctx Context, inode Ino, flags uint8, length uint64, at
 	return errno(err)
 }
 
-func (m *dbMeta) Fallocate(ctx Context, inode Ino, mode uint8, off uint64, size uint64) syscall.Errno {
+func (m *dbMeta) Fallocate(ctx Context, inode Ino, mode uint8, off uint64, size uint64, flength *uint64) syscall.Errno {
 	if mode&fallocCollapesRange != 0 && mode != fallocCollapesRange {
 		return syscall.EINVAL
 	}
@@ -1092,6 +1250,9 @@ func (m *dbMeta) Fallocate(ctx Context, inode Ino, mode uint8, off uint64, size 
 		if _, err := s.Cols("length", "mtime", "ctime", "mtimensec", "ctimensec").Update(&nodeAttr, &node{Inode: inode}); err != nil {
 			return err
 		}
+		if flength != nil {
+			*flength = length
+		}
 		if mode&(fallocZeroRange|fallocPunchHole) != 0 && off < old {
 			off, size := off, size
 			if off+size > old {
@@ -1144,13 +1305,16 @@ func (m *dbMeta) doReadlink(ctx Context, inode Ino, noatime bool) (atime int64, 
 		if !ok {
 			return syscall.ENOENT
 		}
+		if nodeAttr.Type != TypeSymlink {
+			return syscall.EINVAL
+		}
 		l := symlink{Inode: inode}
 		ok, e = s.Get(&l)
 		if e != nil {
 			return e
 		}
 		if !ok {
-			return syscall.ENOENT
+			return syscall.EIO
 		}
 		m.parseAttr(&nodeAttr, attr)
 		target = l.Target
@@ -1183,7 +1347,6 @@ func (m *dbMeta) doMknod(ctx Context, parent Ino, name string, _type uint8, mode
 	var n node
 	n.Inode = ino
 	n.Type = _type
-	n.Mode = mode & ^cumask
 	n.Uid = ctx.Uid()
 	n.Gid = ctx.Gid()
 	if _type == TypeDirectory {
@@ -1258,6 +1421,40 @@ func (m *dbMeta) doMknod(ctx Context, parent Ino, name string, _type uint8, mode
 			return syscall.EEXIST
 		}
 
+		mode &= 07777
+		if pattr.DefaultACL != aclAPI.None && _type != TypeSymlink {
+			// inherit default acl
+			if _type == TypeDirectory {
+				n.DefaultACLId = pattr.DefaultACL
+			}
+
+			// set access acl by parent's default acl
+			rule, err := m.getACL(s, pattr.DefaultACL)
+			if err != nil {
+				return err
+			}
+
+			if rule.IsMinimal() {
+				// simple acl as default
+				n.Mode = (mode & 0xFE00) | rule.GetMode()
+			} else {
+				if err = m.tryLoadMissACLs(s); err != nil {
+					logger.Warnf("Mknode: load miss acls error: %s", err)
+				}
+
+				cRule := rule.ChildAccessACL(mode)
+				id, err := m.insertACL(s, cRule)
+				if err != nil {
+					return err
+				}
+
+				n.AccessACLId = id
+				n.Mode = (mode & 0xFE00) | cRule.GetMode()
+			}
+		} else {
+			n.Mode = mode & ^cumask
+		}
+
 		var updateParent bool
 		now := time.Now().UnixNano()
 		if parent != TrashInode {
@@ -1265,7 +1462,7 @@ func (m *dbMeta) doMknod(ctx Context, parent Ino, name string, _type uint8, mode
 				pn.Nlink++
 				updateParent = true
 			}
-			if updateParent || time.Duration(now-pn.Mtime*1e3-int64(pn.Mtimensec)) >= minUpdateTime {
+			if updateParent || time.Duration(now-pn.Mtime*1e3-int64(pn.Mtimensec)) >= m.conf.SkipDirMtime {
 				pn.Mtime = now / 1e3
 				pn.Ctime = now / 1e3
 				updateParent = true
@@ -1406,7 +1603,7 @@ func (m *dbMeta) doUnlink(ctx Context, parent Ino, name string, attr *Attr, skip
 		defer func() { m.of.InvalidateChunk(e.Inode, invalidateAttrOnly) }()
 
 		var updateParent bool
-		if !isTrash(parent) && time.Duration(now-pn.Mtime*1e3-int64(pn.Mtimensec)) >= minUpdateTime {
+		if !isTrash(parent) && time.Duration(now-pn.Mtime*1e3-int64(pn.Mtimensec)) >= m.conf.SkipDirMtime {
 			pn.Mtime = now / 1e3
 			pn.Ctime = now / 1e3
 			pn.Mtimensec = int16(now % 1e3)
@@ -1565,6 +1762,7 @@ func (m *dbMeta) doRmdir(ctx Context, parent Ino, name string, pinode *Ino, skip
 		}
 		if _, err := s.Delete(&dirStats{Inode: e.Inode}); err != nil {
 			logger.Warnf("remove dir usage of ino(%d): %s", e.Inode, err)
+			return err
 		}
 		if _, err = s.Delete(&dirQuota{Inode: e.Inode}); err != nil {
 			return err
@@ -1674,6 +1872,10 @@ func (m *dbMeta) doRename(ctx Context, parentSrc Ino, nameSrc string, parentDst 
 				*inode = se.Inode
 			}
 			return nil
+		}
+		// TODO: check parentDst is a subdir of source node
+		if se.Inode == parentDst || se.Inode == dpattr.Parent {
+			return syscall.EPERM
 		}
 		var sn = node{Inode: se.Inode}
 		ok, err = s.Get(&sn)
@@ -1789,14 +1991,14 @@ func (m *dbMeta) doRename(ctx Context, parentSrc Ino, nameSrc string, parentDst 
 				sn.Parent = parentDst
 			}
 		}
-		if supdate || time.Duration(now-spn.Mtime*1e3-int64(spn.Mtimensec)) >= minUpdateTime {
+		if supdate || time.Duration(now-spn.Mtime*1e3-int64(spn.Mtimensec)) >= m.conf.SkipDirMtime {
 			spn.Mtime = now / 1e3
 			spn.Ctime = now / 1e3
 			spn.Mtimensec = int16(now % 1e3)
 			spn.Ctimensec = int16(now % 1e3)
 			supdate = true
 		}
-		if dupdate || time.Duration(now-dpn.Mtime*1e3-int64(dpn.Mtimensec)) >= minUpdateTime {
+		if dupdate || time.Duration(now-dpn.Mtime*1e3-int64(dpn.Mtimensec)) >= m.conf.SkipDirMtime {
 			dpn.Mtime = now / 1e3
 			dpn.Ctime = now / 1e3
 			dpn.Mtimensec = int16(now % 1e3)
@@ -1963,7 +2165,7 @@ func (m *dbMeta) doLink(ctx Context, inode, parent Ino, name string, attr *Attr)
 
 		var updateParent bool
 		now := time.Now().UnixNano()
-		if time.Duration(now-pn.Mtime*1e3-int64(pn.Mtimensec)) >= minUpdateTime {
+		if time.Duration(now-pn.Mtime*1e3-int64(pn.Mtimensec)) >= m.conf.SkipDirMtime {
 			pn.Mtime = now / 1e3
 			pn.Ctime = now / 1e3
 			updateParent = true
@@ -2037,7 +2239,7 @@ func (m *dbMeta) doCleanStaleSession(sid uint64) error {
 		return nil
 	})
 	if err != nil {
-		logger.Warnf("Delete flock/plock with sid %d: %d", sid, err)
+		logger.Warnf("Delete flock/plock with sid %d: %s", sid, err)
 		fail = true
 	}
 
@@ -2166,6 +2368,10 @@ func (m *dbMeta) Read(ctx Context, inode Ino, indx uint32, slices *[]Slice) (rer
 			m.touchAtime(ctx, inode, nil)
 		}
 	}()
+
+	if slices != nil {
+		*slices = nil
+	}
 	f := m.of.find(inode)
 	if f != nil {
 		f.RLock()
@@ -2183,6 +2389,17 @@ func (m *dbMeta) Read(ctx Context, inode Ino, indx uint32, slices *[]Slice) (rer
 	})
 	if err != nil {
 		return errno(err)
+	}
+	if len(c.Slices) == 0 {
+		var attr Attr
+		eno := m.doGetAttr(ctx, inode, &attr)
+		if eno != 0 {
+			return eno
+		}
+		if attr.Typ != TypeFile {
+			return syscall.EPERM
+		}
+		return 0
 	}
 	ss := readSliceBuf(c.Slices)
 	if ss == nil {
@@ -2235,27 +2452,20 @@ func (m *dbMeta) Write(ctx Context, inode Ino, indx uint32, off uint32, slice Sl
 		nodeAttr.Ctime = ctime.UnixNano() / 1e3
 		nodeAttr.Ctimensec = int16(ctime.Nanosecond())
 
-		var ck = chunk{Inode: inode, Indx: indx}
-		ok, err = s.ForUpdate().MustCols("indx").Get(&ck)
-		if err != nil {
-			return err
-		}
 		buf := marshalSlice(off, slice.Id, slice.Size, slice.Off, slice.Len)
-		if ok {
-			if err := m.appendSlice(s, inode, indx, buf); err != nil {
-				return err
-			}
-		} else {
-			if err = mustInsert(s, &chunk{Inode: inode, Indx: indx, Slices: buf}); err != nil {
-				return err
-			}
+		var insert bool // no compaction check for the first slice
+		if err = m.upsertSlice(s, inode, indx, buf, &insert); err != nil {
+			return err
 		}
 		if err = mustInsert(s, sliceRef{slice.Id, slice.Size, 1}); err != nil {
 			return err
 		}
 		_, err = s.Cols("length", "mtime", "ctime", "mtimensec", "ctimensec").Update(&nodeAttr, &node{Inode: inode})
-		if err == nil {
-			needCompact = (len(ck.Slices)/sliceBytes)%100 == 99
+		if err == nil && !insert {
+			ck := chunk{Inode: inode, Indx: indx}
+			_, _ = s.MustCols("indx").Get(&ck)
+			ns := len(ck.Slices) / sliceBytes // number of slices
+			needCompact = ns%100 == 99 || ns > 350
 		}
 		return err
 	}, inode)
@@ -2268,7 +2478,7 @@ func (m *dbMeta) Write(ctx Context, inode Ino, indx uint32, off uint32, slice Sl
 	return errno(err)
 }
 
-func (m *dbMeta) CopyFileRange(ctx Context, fin Ino, offIn uint64, fout Ino, offOut uint64, size uint64, flags uint32, copied *uint64) syscall.Errno {
+func (m *dbMeta) CopyFileRange(ctx Context, fin Ino, offIn uint64, fout Ino, offOut uint64, size uint64, flags uint32, copied, outLength *uint64) syscall.Errno {
 	defer m.timeit("CopyFileRange", time.Now())
 	f := m.of.find(fout)
 	if f != nil {
@@ -2290,7 +2500,9 @@ func (m *dbMeta) CopyFileRange(ctx Context, fin Ino, offIn uint64, fout Ino, off
 			return syscall.EINVAL
 		}
 		if offIn >= nin.Length {
-			*copied = 0
+			if copied != nil {
+				*copied = 0
+			}
 			return nil
 		}
 		size := size
@@ -2318,6 +2530,9 @@ func (m *dbMeta) CopyFileRange(ctx Context, fin Ino, offIn uint64, fout Ino, off
 		nout.Ctime = now / 1e3
 		nout.Mtimensec = int16(now % 1e3)
 		nout.Ctimensec = int16(now % 1e3)
+		if outLength != nil {
+			*outLength = nout.Length
+		}
 
 		var cs []chunk
 		err = s.Where("inode = ? AND indx >= ? AND indx <= ?", fin, offIn/ChunkSize, (offIn+size)/ChunkSize).ForUpdate().Find(&cs)
@@ -2388,7 +2603,9 @@ func (m *dbMeta) CopyFileRange(ctx Context, fin Ino, offIn uint64, fout Ino, off
 		if _, err := s.Cols("length", "mtime", "ctime", "mtimensec", "ctimensec").Update(&nout, &node{Inode: fout}); err != nil {
 			return err
 		}
-		*copied = size
+		if copied != nil {
+			*copied = size
+		}
 		return nil
 	}, fout)
 	if err == nil {
@@ -2733,6 +2950,9 @@ func (m *dbMeta) compactChunk(inode Ino, indx uint32, force bool) {
 	if err != nil {
 		return
 	}
+	if len(c.Slices) > sliceBytes*maxCompactSlices {
+		c.Slices = c.Slices[:sliceBytes*maxCompactSlices]
+	}
 
 	ss := readSliceBuf(c.Slices)
 	if ss == nil {
@@ -2740,10 +2960,17 @@ func (m *dbMeta) compactChunk(inode Ino, indx uint32, force bool) {
 		return
 	}
 	skipped := skipSome(ss)
+	var first, last *slice
+	if skipped > 0 {
+		first, last = ss[0], ss[skipped-1]
+	}
 	ss = ss[skipped:]
 	pos, size, slices := compactChunk(ss)
 	if len(ss) < 2 || size == 0 {
 		return
+	}
+	if first != nil && last != nil && pos+size > first.pos && last.pos+last.len > pos {
+		panic(fmt.Sprintf("invalid compaction: skipped slices [%+v, %+v], pos %d, size %d", *first, *last, pos, size))
 	}
 
 	var id uint64
@@ -3116,6 +3343,17 @@ func (m *dbMeta) ListXattr(ctx Context, inode Ino, names *[]byte) syscall.Errno 
 			*names = append(*names, []byte(x.Name)...)
 			*names = append(*names, 0)
 		}
+
+		var n = node{Inode: inode}
+		ok, err := s.Get(&n)
+		if err != nil {
+			return err
+		} else if !ok {
+			return syscall.ENOENT
+		}
+		attr := &Attr{}
+		m.parseAttr(&n, attr)
+		setXAttrACL(names, attr.AccessACL, attr.DefaultACL)
 		return nil
 	}))
 }
@@ -3180,28 +3418,46 @@ func (m *dbMeta) doGetQuota(ctx Context, inode Ino) (*Quota, error) {
 	})
 }
 
-func (m *dbMeta) doSetQuota(ctx Context, inode Ino, quota *Quota, create bool) error {
-	return m.txn(func(s *xorm.Session) error {
-		q := dirQuota{Inode: inode}
-		ok, e := s.ForUpdate().Get(&q)
+func (m *dbMeta) doSetQuota(ctx Context, inode Ino, quota *Quota) (bool, error) {
+	var created bool
+	err := m.txn(func(s *xorm.Session) error {
+		origin := dirQuota{Inode: inode}
+		exist, e := s.ForUpdate().Get(&origin)
 		if e != nil {
 			return e
 		}
-		q.MaxSpace, q.MaxInodes = quota.MaxSpace, quota.MaxInodes
-		if ok {
-			if create {
-				q.UsedSpace, q.UsedInodes = quota.UsedSpace, quota.UsedInodes
-				_, e = s.Cols("max_space", "max_inodes", "used_space", "used_inodes").Update(&q, &dirQuota{Inode: inode})
-			} else {
-				quota.UsedSpace, quota.UsedInodes = q.UsedSpace, q.UsedInodes
-				_, e = s.Cols("max_space", "max_inodes").Update(&q, &dirQuota{Inode: inode})
-			}
-		} else if create {
-			q.UsedSpace, q.UsedInodes = quota.UsedSpace, quota.UsedInodes
-			e = mustInsert(s, &q)
+		if exist {
+			created = false
+		} else if quota.MaxSpace < 0 && quota.MaxInodes < 0 {
+			return errors.Errorf("limitation not set or deleted")
+		} else {
+			created = true
+		}
+		updateColumns := make([]string, 0, 4)
+		if quota.MaxSpace >= 0 {
+			origin.MaxSpace = quota.MaxSpace
+			updateColumns = append(updateColumns, "max_space")
+		}
+		if quota.MaxInodes >= 0 {
+			origin.MaxInodes = quota.MaxInodes
+			updateColumns = append(updateColumns, "max_inodes")
+		}
+		if quota.UsedSpace >= 0 {
+			origin.UsedSpace = quota.UsedSpace
+			updateColumns = append(updateColumns, "used_space")
+		}
+		if quota.UsedInodes >= 0 {
+			origin.UsedInodes = quota.UsedInodes
+			updateColumns = append(updateColumns, "used_inodes")
+		}
+		if exist {
+			_, e = s.Cols(updateColumns...).Update(&origin, &dirQuota{Inode: inode})
+		} else {
+			e = mustInsert(s, &origin)
 		}
 		return e
 	})
+	return created, err
 }
 
 func (m *dbMeta) doDelQuota(ctx Context, inode Ino) error {
@@ -3246,26 +3502,27 @@ func (m *dbMeta) doFlushQuotas(ctx Context, quotas map[Ino]*Quota) error {
 	})
 }
 
-func (m *dbMeta) dumpEntry(s *xorm.Session, inode Ino, typ uint8) (*DumpedEntry, error) {
-	e := &DumpedEntry{}
+func (m *dbMeta) dumpEntry(s *xorm.Session, inode Ino, typ uint8, e *DumpedEntry, showProgress func(totalIncr, currentIncr int64)) error {
 	n := &node{Inode: inode}
 	ok, err := s.Get(n)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	attr := &Attr{Typ: typ, Nlink: 1}
 	if !ok {
 		logger.Warnf("The entry of the inode was not found. inode: %d", inode)
+		if attr.Typ == TypeDirectory {
+			attr.Nlink = 2
+		}
 	} else {
 		m.parseAttr(n, attr)
 	}
-	e.Attr = &DumpedAttr{}
 	dumpAttr(attr, e.Attr)
 	e.Attr.Inode = inode
 
 	var rows []xattr
 	if err = s.Find(&rows, &xattr{Inode: inode}); err != nil {
-		return nil, err
+		return err
 	}
 	if len(rows) > 0 {
 		xattrs := make([]*DumpedXattr, 0, len(rows))
@@ -3276,11 +3533,26 @@ func (m *dbMeta) dumpEntry(s *xorm.Session, inode Ino, typ uint8) (*DumpedEntry,
 		e.Xattrs = xattrs
 	}
 
+	if attr.AccessACL != aclAPI.None {
+		accessACl, err := m.getACL(s, attr.AccessACL)
+		if err != nil {
+			return err
+		}
+		e.AccessACL = dumpACL(accessACl)
+	}
+	if attr.DefaultACL != aclAPI.None {
+		defaultACL, err := m.getACL(s, attr.DefaultACL)
+		if err != nil {
+			return err
+		}
+		e.DefaultACL = dumpACL(defaultACL)
+	}
+
 	if attr.Typ == TypeFile {
 		for indx := uint32(0); uint64(indx)*ChunkSize < attr.Length; indx++ {
 			c := &chunk{Inode: inode, Indx: indx}
 			if ok, err = s.MustCols("indx").Get(c); err != nil {
-				return nil, err
+				return err
 			}
 			if !ok {
 				continue
@@ -3299,21 +3571,41 @@ func (m *dbMeta) dumpEntry(s *xorm.Session, inode Ino, typ uint8) (*DumpedEntry,
 		l := &symlink{Inode: inode}
 		ok, err = s.Get(l)
 		if err != nil {
-			return nil, err
+			return err
 		}
 		if !ok {
 			logger.Warnf("no link target for inode %d", inode)
 		}
 		e.Symlink = string(l.Target)
+	} else if attr.Typ == TypeDirectory {
+		var edges []*edge
+		err := s.Limit(1000, 0).Find(&edges, &edge{Parent: inode})
+		if err != nil {
+			return err
+		}
+		if showProgress != nil {
+			showProgress(int64(len(edges)), 0)
+		}
+		if len(edges) < 1000 {
+			e.Entries = make(map[string]*DumpedEntry, len(edges))
+			for _, edge := range edges {
+				name := string(edge.Name)
+				ce := entryPool.Get()
+				ce.Name = name
+				ce.Attr.Inode = edge.Inode
+				ce.Attr.Type = typeToString(edge.Type)
+				e.Entries[name] = ce
+			}
+		}
 	}
-	return e, nil
+	return nil
 }
 
-func (m *dbMeta) dumpEntryFast(s *xorm.Session, inode Ino, typ uint8) *DumpedEntry {
+func (m *dbMeta) dumpEntryFast(inode Ino, typ uint8) *DumpedEntry {
 	e := &DumpedEntry{}
 	n, ok := m.snap.node[inode]
 	if !ok && inode != TrashInode {
-		logger.Errorf("Corrupt inode: %d, missing attribute", inode)
+		logger.Warnf("Corrupt inode: %d, missing attribute", inode)
 	}
 
 	attr := &Attr{Typ: typ, Nlink: 1}
@@ -3330,6 +3622,13 @@ func (m *dbMeta) dumpEntryFast(s *xorm.Session, inode Ino, typ uint8) *DumpedEnt
 		}
 		sort.Slice(xattrs, func(i, j int) bool { return xattrs[i].Name < xattrs[j].Name })
 		e.Xattrs = xattrs
+	}
+
+	if attr.AccessACL != aclAPI.None {
+		e.AccessACL = dumpACL(m.aclCache.Get(attr.AccessACL))
+	}
+	if attr.DefaultACL != aclAPI.None {
+		e.DefaultACL = dumpACL(m.aclCache.Get(attr.DefaultACL))
 	}
 
 	if attr.Typ == TypeFile {
@@ -3365,37 +3664,108 @@ func (m *dbMeta) dumpDir(s *xorm.Session, inode Ino, tree *DumpedEntry, bw *bufi
 			panic(err)
 		}
 	}
-	var edges []*edge
-	var err error
-	if m.snap != nil {
-		edges = m.snap.edges[inode]
-	} else {
-		err = s.Find(&edges, &edge{Parent: inode})
+	if tree.Entries == nil {
+		// retry for large directory
+		var edges []*edge
+		err := s.Find(&edges, &edge{Parent: inode})
 		if err != nil {
 			return err
 		}
+		tree.Entries = make(map[string]*DumpedEntry, len(edges))
+		for _, edge := range edges {
+			name := string(edge.Name)
+			ce := entryPool.Get()
+			ce.Name = name
+			ce.Attr.Inode = edge.Inode
+			ce.Attr.Type = typeToString(edge.Type)
+			tree.Entries[name] = ce
+		}
+		if showProgress != nil {
+			showProgress(int64(len(edges))-1000, 0)
+		}
+	}
+	var entries []*DumpedEntry
+	for _, e := range tree.Entries {
+		entries = append(entries, e)
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].Name < entries[j].Name })
+	_ = tree.writeJsonWithOutEntry(bw, depth)
+
+	var concurrent = 10
+	ms := make([]sync.Mutex, concurrent)
+	conds := make([]*sync.Cond, concurrent)
+	ready := make([]bool, concurrent)
+	var err error
+	for c := 0; c < concurrent; c++ {
+		conds[c] = sync.NewCond(&ms[c])
+		if c < len(entries) {
+			go func(c int) {
+				_ = m.roTxn(func(s *xorm.Session) error {
+					for i := c; i < len(entries) && err == nil; i += concurrent {
+						e := entries[i]
+						er := m.dumpEntry(s, e.Attr.Inode, 0, e, showProgress)
+						ms[c].Lock()
+						ready[c] = true
+						if er != nil {
+							err = er
+						}
+						conds[c].Signal()
+						for ready[c] && err == nil {
+							conds[c].Wait()
+						}
+						ms[c].Unlock()
+					}
+					return nil
+				})
+			}(c)
+		}
 	}
 
-	if showProgress != nil {
-		showProgress(int64(len(edges)), 0)
+	for i, e := range entries {
+		c := i % concurrent
+		ms[c].Lock()
+		for !ready[c] && err == nil {
+			conds[c].Wait()
+		}
+		ready[c] = false
+		conds[c].Signal()
+		ms[c].Unlock()
+		if err != nil {
+			return err
+		}
+		if e.Attr.Type == "directory" {
+			err = m.dumpDir(s, e.Attr.Inode, e, bw, depth+2, showProgress)
+		} else {
+			err = e.writeJSON(bw, depth+2)
+		}
+		if err != nil {
+			return err
+		}
+		entries[i] = nil
+		entryPool.Put(e)
+		if i != len(entries)-1 {
+			bwWrite(",")
+		}
+		if showProgress != nil {
+			showProgress(0, 1)
+		}
 	}
-	if err := tree.writeJsonWithOutEntry(bw, depth); err != nil {
-		return err
-	}
+	bwWrite(fmt.Sprintf("\n%s}\n%s}", strings.Repeat(jsonIndent, depth+1), strings.Repeat(jsonIndent, depth)))
+	return nil
+}
 
+func (m *dbMeta) dumpDirFast(inode Ino, tree *DumpedEntry, bw *bufio.Writer, depth int, showProgress func(totalIncr, currentIncr int64)) error {
+	bwWrite := func(s string) {
+		if _, err := bw.WriteString(s); err != nil {
+			panic(err)
+		}
+	}
+	edges := m.snap.edges[inode]
+	_ = tree.writeJsonWithOutEntry(bw, depth)
 	sort.Slice(edges, func(i, j int) bool { return bytes.Compare(edges[i].Name, edges[j].Name) == -1 })
 
-	for idx, e := range edges {
-		var entry *DumpedEntry
-		if m.snap != nil {
-			entry = m.dumpEntryFast(s, e.Inode, e.Type)
-		} else {
-			entry, err = m.dumpEntry(s, e.Inode, e.Type)
-			if err != nil {
-				return err
-			}
-		}
-
+	for i, e := range edges {
+		entry := m.dumpEntryFast(e.Inode, e.Type)
 		if entry == nil {
 			logger.Warnf("ignore broken entry %s (inode: %d) in %s", string(e.Name), e.Inode, inode)
 			continue
@@ -3403,14 +3773,11 @@ func (m *dbMeta) dumpDir(s *xorm.Session, inode Ino, tree *DumpedEntry, bw *bufi
 
 		entry.Name = string(e.Name)
 		if e.Type == TypeDirectory {
-			err = m.dumpDir(s, e.Inode, entry, bw, depth+2, showProgress)
+			_ = m.dumpDirFast(e.Inode, entry, bw, depth+2, showProgress)
 		} else {
-			err = entry.writeJSON(bw, depth+2)
+			_ = entry.writeJSON(bw, depth+2)
 		}
-		if err != nil {
-			return err
-		}
-		if idx != len(edges)-1 {
+		if i != len(edges)-1 {
 			bwWrite(",")
 		}
 		if showProgress != nil {
@@ -3430,14 +3797,13 @@ func (m *dbMeta) makeSnap(ses *xorm.Session, bar *utils.Bar) error {
 		chunk:   make(map[string]*chunk),
 	}
 
-	for _, s := range []interface{}{new(node), new(symlink), new(edge), new(xattr), new(chunk)} {
+	for _, s := range []interface{}{new(node), new(symlink), new(edge), new(xattr), new(chunk), new(acl)} {
 		if count, err := ses.Count(s); err == nil {
 			bar.IncrTotal(count)
 		} else {
 			return err
 		}
 	}
-
 	if err := ses.Table(&node{}).Iterate(new(node), func(idx int, bean interface{}) error {
 		n := bean.(*node)
 		snap.node[n.Inode] = n
@@ -3481,13 +3847,24 @@ func (m *dbMeta) makeSnap(ses *xorm.Session, bar *utils.Bar) error {
 	}); err != nil {
 		return err
 	}
+
+	if err := ses.Table(&acl{}).Iterate(new(acl), func(idx int, bean interface{}) error {
+		a := bean.(*acl)
+		m.aclCache.Put(a.Id, a.toRule())
+		bar.Increment()
+		return nil
+	}); err != nil {
+		return err
+	}
+
 	m.snap = snap
 	return nil
 }
 
-func (m *dbMeta) DumpMeta(w io.Writer, root Ino, keepSecret bool) (err error) {
+func (m *dbMeta) DumpMeta(w io.Writer, root Ino, keepSecret, fast, skipTrash bool) (err error) {
 	defer func() {
 		if p := recover(); p != nil {
+			debug.PrintStack()
 			if e, ok := p.(error); ok {
 				err = e
 			} else {
@@ -3500,18 +3877,37 @@ func (m *dbMeta) DumpMeta(w io.Writer, root Ino, keepSecret bool) (err error) {
 	var tree, trash *DumpedEntry
 	root = m.checkRoot(root)
 	return m.roTxn(func(s *xorm.Session) error {
-		if root == RootInode {
+		if root == RootInode && fast {
 			defer func() { m.snap = nil }()
 			bar := progress.AddCountBar("Snapshot keys", 0)
 			if err = m.makeSnap(s, bar); err != nil {
 				return fmt.Errorf("Fetch all metadata from DB: %s", err)
 			}
 			bar.Done()
-			tree = m.dumpEntryFast(s, root, TypeDirectory)
-			trash = m.dumpEntryFast(s, TrashInode, TypeDirectory)
+			tree = m.dumpEntryFast(root, TypeDirectory)
+			trash = m.dumpEntryFast(TrashInode, TypeDirectory)
 		} else {
-			if tree, err = m.dumpEntry(s, root, TypeDirectory); err != nil {
+			tree = &DumpedEntry{
+				Name: "FSTree",
+				Attr: &DumpedAttr{
+					Inode: root,
+					Type:  typeToString(TypeDirectory),
+				},
+			}
+			if err = m.dumpEntry(s, root, TypeDirectory, tree, nil); err != nil {
 				return err
+			}
+			if root == 1 && !skipTrash {
+				trash = &DumpedEntry{
+					Name: "Trash",
+					Attr: &DumpedAttr{
+						Inode: TrashInode,
+						Type:  typeToString(TypeDirectory),
+					},
+				}
+				if err = m.dumpEntry(s, TrashInode, TypeDirectory, trash, nil); err != nil {
+					return err
+				}
 			}
 		}
 		if tree == nil {
@@ -3603,17 +3999,27 @@ func (m *dbMeta) DumpMeta(w io.Writer, root Ino, keepSecret bool) (err error) {
 			bar.IncrTotal(totalIncr)
 			bar.IncrInt64(currentIncr)
 		}
-		if err = m.dumpDir(s, root, tree, bw, 1, showProgress); err != nil {
-			logger.Errorf("dump dir %d failed: %s", root, err)
-			return fmt.Errorf("dump dir %d failed", root) // don't retry
+		if m.snap != nil {
+			_ = m.dumpDirFast(root, tree, bw, 1, showProgress)
+		} else {
+			showProgress(int64(len(tree.Entries)), 0)
+			if err = m.dumpDir(s, root, tree, bw, 1, showProgress); err != nil {
+				logger.Errorf("dump dir %d failed: %s", root, err)
+				return fmt.Errorf("dump dir %d failed", root) // don't retry
+			}
 		}
 		if trash != nil {
 			if _, err = bw.WriteString(","); err != nil {
 				return err
 			}
-			if err = m.dumpDir(s, TrashInode, trash, bw, 1, showProgress); err != nil {
-				logger.Errorf("dump trash failed: %s", err)
-				return fmt.Errorf("dump trash failed") // don't retry
+			if m.snap != nil {
+				_ = m.dumpDirFast(TrashInode, trash, bw, 1, showProgress)
+			} else {
+				showProgress(int64(len(trash.Entries)), 0)
+				if err = m.dumpDir(s, TrashInode, trash, bw, 1, showProgress); err != nil {
+					logger.Errorf("dump trash failed: %s", err)
+					return fmt.Errorf("dump trash failed") // don't retry
+				}
 			}
 		}
 		if _, err = bw.WriteString("\n}\n"); err != nil {
@@ -3624,7 +4030,7 @@ func (m *dbMeta) DumpMeta(w io.Writer, root Ino, keepSecret bool) (err error) {
 	})
 }
 
-func (m *dbMeta) loadEntry(e *DumpedEntry, chs []chan interface{}) {
+func (m *dbMeta) loadEntry(e *DumpedEntry, chs []chan interface{}, aclMaxId *uint32) {
 	inode := e.Attr.Inode
 	attr := e.Attr
 	n := &node{
@@ -3686,6 +4092,16 @@ func (m *dbMeta) loadEntry(e *DumpedEntry, chs []chan interface{}) {
 	for _, x := range e.Xattrs {
 		chs[4] <- &xattr{Inode: inode, Name: x.Name, Value: unescape(x.Value)}
 	}
+
+	if e.AccessACL != nil {
+		r := loadACL(e.AccessACL)
+		n.AccessACLId, _ = m.aclCache.GetOrPut(r, aclMaxId)
+	}
+
+	if e.DefaultACL != nil {
+		r := loadACL(e.DefaultACL)
+		n.DefaultACLId, _ = m.aclCache.GetOrPut(r, aclMaxId)
+	}
 	chs[0] <- n
 }
 
@@ -3721,6 +4137,9 @@ func (m *dbMeta) LoadMeta(r io.Reader) error {
 	}
 	if err := m.syncTable(new(detachedNode)); err != nil {
 		return fmt.Errorf("create table detachedNode: %s", err)
+	}
+	if err = m.syncTable(new(acl)); err != nil {
+		return fmt.Errorf("create table acl: %s", err)
 	}
 	var batch int
 	switch m.Name() {
@@ -3771,13 +4190,18 @@ func (m *dbMeta) LoadMeta(r io.Reader) error {
 		}(i)
 	}
 
+	var aclMaxId uint32 = 0
 	dm, counters, parents, refs, err := loadEntries(r,
-		func(e *DumpedEntry) { m.loadEntry(e, chs) },
+		func(e *DumpedEntry) { m.loadEntry(e, chs, &aclMaxId) },
 		func(ck *chunkKey) { chs[3] <- &sliceRef{ck.id, ck.size, 1} })
 	if err != nil {
 		return err
 	}
 	m.loadDumpedQuotas(Background, dm.Quotas)
+	if err = m.loadDumpedACLs(Background); err != nil {
+		return err
+	}
+
 	format, _ := json.MarshalIndent(dm.Setting, "", "")
 	chs[5] <- &setting{"format", string(format)}
 	chs[5] <- &counter{usedSpace, counters.UsedSpace}
@@ -4079,4 +4503,175 @@ func (m *dbMeta) doTouchAtime(ctx Context, inode Ino, attr *Attr, now time.Time)
 		return err
 	}, inode)
 	return updated, err
+}
+
+func (m *dbMeta) insertACL(s *xorm.Session, rule *aclAPI.Rule) (uint32, error) {
+	var aclId uint32
+	if aclId = m.aclCache.GetId(rule); aclId == aclAPI.None {
+		// TODO conflicts from multiple clients are rare and result in only minor duplicates, thus not addressed for now.
+		val := newSQLAcl(rule)
+		if _, err := s.Insert(val); err != nil {
+			return aclAPI.None, err
+		}
+		aclId = val.Id
+		m.aclCache.Put(aclId, rule)
+	}
+	return aclId, nil
+}
+
+func (m *dbMeta) tryLoadMissACLs(s *xorm.Session) error {
+	missIds := m.aclCache.GetMissIds()
+	if len(missIds) > 0 {
+		var acls []acl
+		if err := s.In("id", missIds).Find(&acls); err != nil {
+			return err
+		}
+
+		for _, data := range acls {
+			m.aclCache.Put(data.Id, data.toRule())
+		}
+	}
+	return nil
+}
+
+func (m *dbMeta) getACL(s *xorm.Session, id uint32) (*aclAPI.Rule, error) {
+	if cRule := m.aclCache.Get(id); cRule != nil {
+		return cRule, nil
+	}
+
+	var aclVal = &acl{Id: id}
+	if ok, err := s.Get(aclVal); err != nil {
+		return nil, err
+	} else if !ok {
+		return nil, ENOATTR
+	}
+
+	r := aclVal.toRule()
+	m.aclCache.Put(id, r)
+	return r, nil
+}
+
+func (m *dbMeta) doSetFacl(ctx Context, ino Ino, aclType uint8, rule *aclAPI.Rule) syscall.Errno {
+	return errno(m.txn(func(s *xorm.Session) error {
+		attr := &Attr{}
+		n := &node{Inode: ino}
+		if ok, err := s.ForUpdate().Get(n); err != nil {
+			return err
+		} else if !ok {
+			return syscall.ENOENT
+		}
+		m.parseAttr(n, attr)
+
+		if ctx.Uid() != 0 && ctx.Uid() != attr.Uid {
+			return syscall.EPERM
+		}
+
+		if attr.Flags&FlagImmutable != 0 {
+			return syscall.EPERM
+		}
+
+		oriACL, oriMode := getAttrACLId(attr, aclType), attr.Mode
+		if rule.IsEmpty() {
+			// remove acl
+			setAttrACLId(attr, aclType, aclAPI.None)
+		} else if rule.IsMinimal() && aclType == aclAPI.TypeAccess {
+			// remove acl
+			setAttrACLId(attr, aclType, aclAPI.None)
+			// set mode
+			attr.Mode &= 07000
+			attr.Mode |= ((rule.Owner & 7) << 6) | ((rule.Group & 7) << 3) | (rule.Other & 7)
+		} else {
+			if err := m.tryLoadMissACLs(s); err != nil {
+				logger.Warnf("SetFacl: load miss acls error: %s", err)
+			}
+
+			// set acl
+			rule.InheritPerms(attr.Mode)
+			aclId, err := m.insertACL(s, rule)
+			if err != nil {
+				return err
+			}
+			setAttrACLId(attr, aclType, aclId)
+
+			// set mode
+			if aclType == aclAPI.TypeAccess {
+				attr.Mode &= 07000
+				attr.Mode |= ((rule.Owner & 7) << 6) | ((rule.Mask & 7) << 3) | (rule.Other & 7)
+			}
+		}
+
+		// update attr
+		var updateCols []string
+		if oriACL != getAttrACLId(attr, aclType) {
+			updateCols = append(updateCols, getACLIdColName(aclType))
+		}
+		if oriMode != attr.Mode {
+			updateCols = append(updateCols, "mode")
+		}
+		if len(updateCols) > 0 {
+			updateCols = append(updateCols, "ctime", "ctimensec")
+
+			var dirtyNode node
+			m.parseNode(attr, &dirtyNode)
+			now := time.Now()
+			dirtyNode.Ctime = now.UnixNano() / 1e3
+			dirtyNode.Ctimensec = int16(now.Nanosecond() % 1000)
+			_, err := s.Cols(updateCols...).Update(&dirtyNode, &node{Inode: ino})
+			return err
+		}
+
+		return nil
+	}, ino))
+}
+
+func (m *dbMeta) doGetFacl(ctx Context, ino Ino, aclType uint8, aclId uint32, rule *aclAPI.Rule) syscall.Errno {
+	return errno(m.roTxn(func(s *xorm.Session) error {
+		if aclId == aclAPI.None {
+			attr := &Attr{}
+			n := &node{Inode: ino}
+			if ok, err := s.Get(n); err != nil {
+				return err
+			} else if !ok {
+				return syscall.ENOENT
+			}
+			m.parseAttr(n, attr)
+			m.of.Update(ino, attr)
+			aclId = getAttrACLId(attr, aclType)
+		}
+
+		if aclId == aclAPI.None {
+			return ENOATTR
+		}
+		a, err := m.getACL(s, aclId)
+		if err != nil {
+			return err
+		}
+		*rule = *a
+		return nil
+	}))
+}
+
+func (m *dbMeta) loadDumpedACLs(ctx Context) error {
+	id2Rule := m.aclCache.GetAll()
+	if len(id2Rule) == 0 {
+		return nil
+	}
+
+	acls := make([]*acl, 0, len(id2Rule))
+	for id, rule := range id2Rule {
+		aclV := newSQLAcl(rule)
+		aclV.Id = id
+		acls = append(acls, aclV)
+	}
+
+	return m.txn(func(s *xorm.Session) error {
+		n, err := s.Insert(acls)
+		if err != nil {
+			return err
+		}
+		if int(n) != len(acls) {
+			return fmt.Errorf("only %d acls inserted, expected %d", n, len(acls))
+		}
+		return nil
+	})
 }

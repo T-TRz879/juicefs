@@ -34,6 +34,7 @@ import (
 )
 
 const (
+	aclCounter     = "aclMaxId"
 	usedSpace      = "usedSpace"
 	totalInodes    = "totalInodes"
 	legacySessions = "sessions"
@@ -256,9 +257,6 @@ func updateLocks(ls []plockRecord, nl plockRecord) []plockRecord {
 }
 
 func (m *baseMeta) emptyDir(ctx Context, inode Ino, skipCheckTrash bool, count *uint64, concurrent chan int) syscall.Errno {
-	if st := m.Access(ctx, inode, MODE_MASK_W|MODE_MASK_X, nil); st != 0 {
-		return st
-	}
 	for {
 		var entries []*Entry
 		if st := m.en.doReaddir(ctx, inode, 0, &entries, 10000); st != 0 && st != syscall.ENOENT {
@@ -266,6 +264,9 @@ func (m *baseMeta) emptyDir(ctx Context, inode Ino, skipCheckTrash bool, count *
 		}
 		if len(entries) == 0 {
 			return 0
+		}
+		if st := m.Access(ctx, inode, MODE_MASK_W|MODE_MASK_X, nil); st != 0 {
+			return st
 		}
 		var wg sync.WaitGroup
 		var status syscall.Errno
@@ -284,14 +285,15 @@ func (m *baseMeta) emptyDir(ctx Context, inode Ino, skipCheckTrash bool, count *
 					wg.Add(1)
 					go func(child Ino, name string) {
 						defer wg.Done()
-						e := m.emptyEntry(ctx, inode, name, child, skipCheckTrash, count, concurrent)
-						if e != 0 && e != syscall.ENOENT {
-							status = e
+						st := m.emptyEntry(ctx, inode, name, child, skipCheckTrash, count, concurrent)
+						if st != 0 && st != syscall.ENOENT {
+							status = st
 						}
 						<-concurrent
 					}(e.Inode, string(e.Name))
 				default:
 					if st := m.emptyEntry(ctx, inode, string(e.Name), e.Inode, skipCheckTrash, count, concurrent); st != 0 && st != syscall.ENOENT {
+						ctx.Cancel()
 						return st
 					}
 				}
@@ -300,6 +302,7 @@ func (m *baseMeta) emptyDir(ctx Context, inode Ino, skipCheckTrash bool, count *
 					atomic.AddUint64(count, 1)
 				}
 				if st := m.Unlink(ctx, inode, string(e.Name), skipCheckTrash); st != 0 && st != syscall.ENOENT {
+					ctx.Cancel()
 					return st
 				}
 			}
@@ -320,6 +323,7 @@ func (m *baseMeta) emptyEntry(ctx Context, parent Ino, name string, inode Ino, s
 	if st == 0 && !isTrash(inode) {
 		st = m.Rmdir(ctx, parent, name, skipCheckTrash)
 		if st == syscall.ENOTEMPTY {
+			// redo when concurrent conflict may happen
 			st = m.emptyEntry(ctx, parent, name, inode, skipCheckTrash, count, concurrent)
 		} else if count != nil {
 			atomic.AddUint64(count, 1)

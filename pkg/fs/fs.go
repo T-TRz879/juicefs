@@ -20,10 +20,10 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"github.com/juicedata/juicefs/pkg/acl"
 	"io"
 	"os"
 	"path"
-	"path/filepath"
 	"runtime/trace"
 	"strconv"
 	"strings"
@@ -86,6 +86,9 @@ func (fs *FileStat) Mode() os.FileMode {
 	}
 	if attr.Mode&01000 != 0 {
 		mode |= os.ModeSticky
+	}
+	if attr.AccessACL+attr.DefaultACL > 0 {
+		mode |= 1 << 18
 	}
 	switch attr.Typ {
 	case meta.TypeDirectory:
@@ -346,7 +349,16 @@ func (fs *FileSystem) StatFS(ctx meta.Context) (totalspace uint64, availspace ui
 	return
 }
 
-func (fs *FileSystem) Open(ctx meta.Context, path string, flags uint32) (f *File, err syscall.Errno) {
+// open file without following symlink
+func (fs *FileSystem) Lopen(ctx meta.Context, path string, flags uint32) (f *File, err syscall.Errno) {
+	return fs.open(ctx, path, flags, false)
+}
+
+func (fs *FileSystem) Open(ctx meta.Context, path string, flags uint32) (*File, syscall.Errno) {
+	return fs.open(ctx, path, flags, true)
+}
+
+func (fs *FileSystem) open(ctx meta.Context, path string, flags uint32, followLink bool) (f *File, err syscall.Errno) {
 	_, task := trace.NewTask(context.TODO(), "Open")
 	defer task.End()
 	l := vfs.NewLogContext(ctx)
@@ -356,7 +368,7 @@ func (fs *FileSystem) Open(ctx meta.Context, path string, flags uint32) (f *File
 		defer func() { fs.log(l, "Lookup (%s): %s", path, errstr(err)) }()
 	}
 	var fi *FileStat
-	fi, err = fs.resolve(ctx, path, true)
+	fi, err = fs.resolve(ctx, path, followLink)
 	if err != 0 {
 		return
 	}
@@ -523,12 +535,7 @@ func (fs *FileSystem) Symlink(ctx meta.Context, target string, link string) (err
 	if err != 0 {
 		return
 	}
-	rel, e := filepath.Rel(parentDir(link), target)
-	if e != nil {
-		// external link
-		rel = target
-	}
-	err = fs.m.Symlink(ctx, fi.inode, path.Base(link), rel, nil, nil)
+	err = fs.m.Symlink(ctx, fi.inode, path.Base(link), target, nil, nil)
 	fs.invalidateEntry(fi.inode, path.Base(link))
 	return
 }
@@ -572,7 +579,7 @@ func (fs *FileSystem) CopyFileRange(ctx meta.Context, src string, soff uint64, d
 	if err != 0 {
 		return
 	}
-	err = fs.m.CopyFileRange(ctx, sfi.inode, soff, dfi.inode, doff, size, 0, &written)
+	err = fs.m.CopyFileRange(ctx, sfi.inode, soff, dfi.inode, doff, size, 0, &written, nil)
 	return
 }
 
@@ -621,6 +628,48 @@ func (fs *FileSystem) RemoveXattr(ctx meta.Context, p string, name string) (err 
 		return
 	}
 	err = fs.m.RemoveXattr(ctx, fi.inode, name)
+	return
+}
+
+func (fs *FileSystem) GetFacl(ctx meta.Context, p string, acltype uint8, rule *acl.Rule) (err syscall.Errno) {
+	defer trace.StartRegion(context.TODO(), "fs.GetFacl").End()
+	l := vfs.NewLogContext(ctx)
+	defer func() { fs.log(l, "GetFacl (%s,%d): %s", p, acltype, errstr(err)) }()
+	fi, err := fs.resolve(ctx, p, true)
+	if err != 0 {
+		return
+	}
+	err = fs.m.GetFacl(ctx, fi.inode, acltype, rule)
+	return
+}
+
+func (fs *FileSystem) SetFacl(ctx meta.Context, p string, acltype uint8, rule *acl.Rule) (err syscall.Errno) {
+	defer trace.StartRegion(context.TODO(), "fs.SetFacl").End()
+	l := vfs.NewLogContext(ctx)
+	defer func() {
+		fs.log(l, "SetFacl (%s,%d,%v): %s", p, acltype, rule, errstr(err))
+	}()
+	fi, err := fs.resolve(ctx, p, true)
+	if err != 0 {
+		return
+	}
+	if acltype == acl.TypeDefault && fi.Mode().IsRegular() {
+		if rule.IsEmpty() {
+			return
+		} else {
+			return syscall.ENOTSUP
+		}
+	}
+	if rule.IsEmpty() {
+		oldRule := acl.EmptyRule()
+		if err = fs.m.GetFacl(ctx, fi.inode, acltype, oldRule); err != 0 {
+			return err
+		}
+		rule.Owner = oldRule.Owner
+		rule.Other = oldRule.Other
+		rule.Group = oldRule.Group & oldRule.Mask
+	}
+	err = fs.m.SetFacl(ctx, fi.inode, acltype, rule)
 	return
 }
 
@@ -681,10 +730,10 @@ func (fs *FileSystem) lookup(ctx meta.Context, parent Ino, name string, inode *I
 }
 
 func (fs *FileSystem) resolve(ctx meta.Context, p string, followLastSymlink bool) (fi *FileStat, err syscall.Errno) {
-	return fs.doResolve(ctx, p, followLastSymlink, 0)
+	return fs.doResolve(ctx, p, followLastSymlink, make(map[Ino]struct{}))
 }
 
-func (fs *FileSystem) doResolve(ctx meta.Context, p string, followLastSymlink bool, depth int) (fi *FileStat, err syscall.Errno) {
+func (fs *FileSystem) doResolve(ctx meta.Context, p string, followLastSymlink bool, visited map[Ino]struct{}) (fi *FileStat, err syscall.Errno) {
 	var inode Ino
 	var attr = &Attr{}
 
@@ -740,8 +789,11 @@ func (fs *FileSystem) doResolve(ctx meta.Context, p string, followLastSymlink bo
 		}
 		fi = AttrToFileInfo(inode, attr)
 		if (!resolved || followLastSymlink) && fi.IsSymlink() {
-			if depth > 39 {
+			if _, ok := visited[inode]; ok {
+				logger.Errorf("find a loop symlink: %d", inode)
 				return nil, syscall.ELOOP
+			} else {
+				visited[inode] = struct{}{}
 			}
 			var buf []byte
 			err = fs.m.ReadLink(ctx, inode, &buf)
@@ -753,7 +805,7 @@ func (fs *FileSystem) doResolve(ctx meta.Context, p string, followLastSymlink bo
 				return &FileStat{name: target}, syscall.ENOTSUP
 			}
 			target = path.Join(strings.Join(ss[:i], "/"), target)
-			fi, err = fs.doResolve(ctx, target, followLastSymlink, depth+1)
+			fi, err = fs.doResolve(ctx, target, followLastSymlink, visited)
 			if err != 0 {
 				return
 			}

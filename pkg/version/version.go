@@ -28,7 +28,7 @@ var (
 	revisionDate = "$Format:%as$"
 	ver          = Semver{
 		major:      1,
-		minor:      1,
+		minor:      2,
 		patch:      0,
 		preRelease: "dev",
 		build:      fmt.Sprintf("%s.%s", revisionDate, revision),
@@ -49,6 +49,10 @@ func Version() string {
 		ver.build = "unknown"
 	}
 	return fmt.Sprintf("%d.%d.%d%s+%s", ver.major, ver.minor, ver.patch, pr, ver.build)
+}
+
+func SetVersion(v string) {
+	ver = *Parse(v)
 }
 
 func Compare(vs string) (int, error) {

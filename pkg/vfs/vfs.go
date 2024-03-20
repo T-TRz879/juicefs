@@ -18,12 +18,15 @@ package vfs
 
 import (
 	"encoding/json"
+	"fmt"
+	"os"
 	"runtime"
 	"sort"
 	"sync"
 	"syscall"
 	"time"
 
+	"github.com/juicedata/juicefs/pkg/acl"
 	"github.com/juicedata/juicefs/pkg/chunk"
 	"github.com/juicedata/juicefs/pkg/meta"
 	"github.com/juicedata/juicefs/pkg/utils"
@@ -37,7 +40,7 @@ type Context = LogContext
 const (
 	rootID      = 1
 	maxName     = meta.MaxName
-	maxSymlink  = 4096
+	maxSymlink  = meta.MaxSymlink
 	maxFileSize = meta.ChunkSize << 31
 )
 
@@ -46,6 +49,63 @@ type Port struct {
 	DebugAgent      string `json:",omitempty"`
 	ConsulAddr      string `json:",omitempty"`
 	PyroscopeAddr   string `json:",omitempty"`
+}
+
+// FuseOptions contains options for fuse mount, keep the same structure with `fuse.MountOptions`
+type FuseOptions struct {
+	AllowOther               bool
+	Options                  []string
+	MaxBackground            int
+	MaxWrite                 int
+	MaxReadAhead             int
+	MaxPages                 int
+	IgnoreSecurityLabels     bool // ignoring labels should be provided as a fusermount mount option.
+	RememberInodes           bool
+	FsName                   string
+	Name                     string
+	SingleThreaded           bool
+	DisableXAttrs            bool
+	Debug                    bool
+	EnableLocks              bool
+	ExplicitDataCacheControl bool
+	DirectMount              bool
+	DirectMountFlags         uintptr
+	EnableAcl                bool
+	EnableWriteback          bool
+	EnableIoctl              bool
+	DontUmask                bool
+	OtherCaps                uint32
+	NoAllocForRead           bool
+}
+
+func (o FuseOptions) StripOptions() FuseOptions {
+	options := o.Options
+	o.Options = make([]string, 0, len(o.Options))
+	for _, opt := range options {
+		if opt == "nonempty" {
+			continue
+		}
+		o.Options = append(o.Options, opt)
+	}
+
+	sort.Strings(o.Options)
+
+	// ignore these options because they won't be send to kernel
+	o.IgnoreSecurityLabels,
+		o.RememberInodes,
+		o.SingleThreaded,
+		o.DisableXAttrs,
+		o.Debug,
+		o.NoAllocForRead = false, false, false, false, false, false
+
+	// ignore there options because they cannot be configured by users
+	o.Name = ""
+	o.MaxBackground = 0
+	o.MaxWrite = 0
+	o.MaxReadAhead = 0
+	o.DirectMount = false
+	o.DontUmask = false
+	return o
 }
 
 type Config struct {
@@ -58,12 +118,20 @@ type Config struct {
 	DirEntryTimeout      time.Duration
 	EntryTimeout         time.Duration
 	BackupMeta           time.Duration
+	BackupSkipTrash      bool
 	FastResolve          bool   `json:",omitempty"`
 	AccessLog            string `json:",omitempty"`
 	PrefixInternal       bool
 	HideInternal         bool
 	RootSquash           *RootSquash `json:",omitempty"`
 	NonDefaultPermission bool        `json:",omitempty"`
+
+	Pid        int
+	PPid       int
+	DebugAgent string
+	CommPath   string       `json:",omitempty"`
+	StatePath  string       `json:",omitempty"`
+	FuseOpts   *FuseOptions `json:",omitempty"`
 }
 
 type RootSquash struct {
@@ -172,6 +240,7 @@ func (v *VFS) Mknod(ctx Context, parent Ino, name string, mode uint16, cumask ui
 	err = v.Meta.Mknod(ctx, parent, name, _type, mode&07777, cumask, rdev, "", &inode, attr)
 	if err == 0 {
 		entry = &meta.Entry{Inode: inode, Attr: attr}
+		v.invalidateDirHandle(parent, name, inode, attr)
 	}
 	return
 }
@@ -187,6 +256,9 @@ func (v *VFS) Unlink(ctx Context, parent Ino, name string) (err syscall.Errno) {
 		return
 	}
 	err = v.Meta.Unlink(ctx, parent, name)
+	if err == 0 {
+		v.invalidateDirHandle(parent, name, 0, nil)
+	}
 	return
 }
 
@@ -208,6 +280,7 @@ func (v *VFS) Mkdir(ctx Context, parent Ino, name string, mode uint16, cumask ui
 	err = v.Meta.Mkdir(ctx, parent, name, mode, cumask, 0, &inode, attr)
 	if err == 0 {
 		entry = &meta.Entry{Inode: inode, Attr: attr}
+		v.invalidateDirHandle(parent, name, inode, attr)
 	}
 	return
 }
@@ -219,6 +292,9 @@ func (v *VFS) Rmdir(ctx Context, parent Ino, name string) (err syscall.Errno) {
 		return
 	}
 	err = v.Meta.Rmdir(ctx, parent, name)
+	if err == 0 {
+		v.invalidateDirHandle(parent, name, 0, nil)
+	}
 	return
 }
 
@@ -240,6 +316,7 @@ func (v *VFS) Symlink(ctx Context, path string, parent Ino, name string) (entry 
 	err = v.Meta.Symlink(ctx, parent, name, path, &inode, attr)
 	if err == 0 {
 		entry = &meta.Entry{Inode: inode, Attr: attr}
+		v.invalidateDirHandle(parent, name, inode, attr)
 	}
 	return
 }
@@ -267,7 +344,14 @@ func (v *VFS) Rename(ctx Context, parent Ino, name string, newparent Ino, newnam
 		return
 	}
 
-	err = v.Meta.Rename(ctx, parent, name, newparent, newname, flags, nil, nil)
+	var inode Ino
+	var attr = &Attr{}
+	err = v.Meta.Rename(ctx, parent, name, newparent, newname, flags, &inode, attr)
+	if err == 0 {
+		v.invalidateDirHandle(parent, name, 0, nil)
+		v.invalidateDirHandle(newparent, newname, 0, nil)
+		v.invalidateDirHandle(newparent, newname, inode, attr)
+	}
 	return
 }
 
@@ -292,6 +376,7 @@ func (v *VFS) Link(ctx Context, ino Ino, newparent Ino, newname string) (entry *
 	err = v.Meta.Link(ctx, ino, newparent, newname, attr)
 	if err == 0 {
 		entry = &meta.Entry{Inode: ino, Attr: attr}
+		v.invalidateDirHandle(newparent, newname, ino, attr)
 	}
 	return
 }
@@ -312,7 +397,7 @@ func (v *VFS) Opendir(ctx Context, ino Ino, flags uint32) (fh uint64, err syscal
 			return
 		}
 	}
-	fh = v.newHandle(ino).fh
+	fh = v.newHandle(ino, true).fh
 	return
 }
 
@@ -357,12 +442,29 @@ func (v *VFS) Readdir(ctx Context, ino Ino, size uint32, off int, fh uint64, plu
 				})
 			}
 		}
+		index := make(map[string]int)
+		for i, e := range inodes {
+			index[string(e.Name)] = i
+		}
+		h.index = index
 	}
 	if off < len(h.children) {
 		entries = h.children[off:]
+		// we don't know how much of them will be sent, assume all of them
+		h.readOff = len(h.children) - 1
 	}
 	readAt = h.readAt
 	return
+}
+
+func (v *VFS) UpdateReaddirOffset(ctx Context, ino Ino, fh uint64, off int) {
+	h := v.findHandle(ino, fh)
+	if h == nil {
+		return
+	}
+	h.Lock()
+	defer h.Unlock()
+	h.readOff = off
 }
 
 func (v *VFS) Releasedir(ctx Context, ino Ino, fh uint64) int {
@@ -398,6 +500,7 @@ func (v *VFS) Create(ctx Context, parent Ino, name string, mode uint16, cumask u
 		v.UpdateLength(inode, attr)
 		fh = v.newFileHandle(inode, attr.Length, flags)
 		entry = &meta.Entry{Inode: inode, Attr: attr}
+		v.invalidateDirHandle(parent, name, inode, attr)
 	}
 	return
 }
@@ -416,7 +519,7 @@ func (v *VFS) Open(ctx Context, ino Ino, flags uint32) (entry *meta.Entry, fh ui
 			err = syscall.EACCES
 			return
 		}
-		h := v.newHandle(ino)
+		h := v.newHandle(ino, true)
 		fh = h.fh
 		n := getInternalNode(ino)
 		if n == nil {
@@ -490,7 +593,7 @@ func (v *VFS) Truncate(ctx Context, ino Ino, size int64, fh uint64, attr *Attr) 
 	if err == 0 {
 		v.writer.Truncate(ino, uint64(size))
 		v.reader.Truncate(ino, uint64(size))
-		v.invalidateLength(ino)
+		v.invalidateAttr(ino)
 	}
 	return err
 }
@@ -522,14 +625,18 @@ func (v *VFS) Release(ctx Context, ino Ino, fh uint64) {
 				}
 			}
 			locks := f.locks
-			owner := f.flockOwner
+			fowner := f.flockOwner
+			powner := f.ofdOwner
 			f.Unlock()
 			if f.writer != nil {
 				_ = f.writer.Flush(ctx)
-				v.invalidateLength(ino)
+				v.invalidateAttr(ino)
 			}
 			if locks&1 != 0 {
-				_ = v.Meta.Flock(ctx, ino, owner, F_UNLCK, false)
+				_ = v.Meta.Flock(ctx, ino, fowner, F_UNLCK, false)
+			}
+			if locks&2 != 0 && powner != 0 {
+				_ = v.Meta.Setlk(ctx, ino, powner, false, F_UNLCK, 0, 0x7FFFFFFFFFFFFFFF, 0)
 			}
 		}
 		_ = v.Meta.Close(ctx, ino)
@@ -537,21 +644,37 @@ func (v *VFS) Release(ctx Context, ino Ino, fh uint64) {
 	}
 }
 
+func hasReadPerm(flag uint32) bool {
+	return (flag & O_ACCMODE) != syscall.O_WRONLY
+}
+
 func (v *VFS) Read(ctx Context, ino Ino, buf []byte, off uint64, fh uint64) (n int, err syscall.Errno) {
 	size := uint32(len(buf))
 	if IsSpecialNode(ino) {
+		if ino == controlInode && runtime.GOOS == "darwin" {
+			fh = v.getControlHandle(ctx.Pid())
+		}
+		h := v.findHandle(ino, fh)
+		if h == nil {
+			err = syscall.EBADF
+			return
+		}
+		switch ino {
+		case statsInode:
+			h.data = collectMetrics(v.registry)
+		case configInode:
+			v.Conf.Format = v.Meta.GetFormat()
+			if v.UpdateFormat != nil {
+				v.UpdateFormat(&v.Conf.Format)
+			}
+			v.Conf.Format.RemoveSecret()
+			h.data, _ = json.MarshalIndent(v.Conf, "", " ")
+		}
+
 		if ino == logInode {
 			n = readAccessLog(fh, buf)
 		} else {
 			defer func() { logit(ctx, "read (%d,%d,%d,%d): %s (%d)", ino, size, off, fh, strerr(err), n) }()
-			if ino == controlInode && runtime.GOOS == "darwin" {
-				fh = v.getControlHandle(ctx.Pid())
-			}
-			h := v.findHandle(ino, fh)
-			if h == nil {
-				err = syscall.EBADF
-				return
-			}
 			h.Lock()
 			defer h.Unlock()
 			if off < h.off {
@@ -580,11 +703,33 @@ func (v *VFS) Read(ctx Context, ino Ino, buf []byte, off uint64, fh uint64) (n i
 		err = syscall.EBADF
 		return
 	}
+	if h.flags&O_RECOVERED != 0 {
+		// recovered
+		var attr Attr
+		err = v.Meta.Open(ctx, ino, syscall.O_RDONLY, &attr)
+		if err != 0 {
+			v.releaseHandle(ino, fh)
+			err = syscall.EBADF
+			return
+		}
+		h.Lock()
+		v.UpdateLength(ino, &attr)
+		h.flags = syscall.O_RDONLY
+		h.reader = v.reader.Open(h.inode, attr.Length)
+		h.Unlock()
+	}
+
 	if off >= maxFileSize || off+uint64(size) >= maxFileSize {
 		err = syscall.EFBIG
 		return
 	}
 	if h.reader == nil {
+		err = syscall.EBADF
+		return
+	}
+
+	// there could be read operation for write-only if kernel writeback is enabled
+	if !v.Conf.FuseOpts.EnableWriteback && !hasReadPerm(h.flags) {
 		err = syscall.EBADF
 		return
 	}
@@ -664,14 +809,15 @@ func (v *VFS) Write(ctx Context, ino Ino, buf []byte, off, fh uint64) (err sysca
 
 	if err == 0 {
 		writtenSizeHistogram.Observe(float64(len(buf)))
-		v.reader.Truncate(ino, v.writer.GetLength(ino))
+		v.reader.Invalidate(ino, off, size)
+		v.invalidateAttr(ino)
 	}
 	return
 }
 
-func (v *VFS) Fallocate(ctx Context, ino Ino, mode uint8, off, length int64, fh uint64) (err syscall.Errno) {
-	defer func() { logit(ctx, "fallocate (%d,%d,%d,%d): %s", ino, mode, off, length, strerr(err)) }()
-	if off < 0 || length <= 0 {
+func (v *VFS) Fallocate(ctx Context, ino Ino, mode uint8, off, size int64, fh uint64) (err syscall.Errno) {
+	defer func() { logit(ctx, "fallocate (%d,%d,%d,%d): %s", ino, mode, off, size, strerr(err)) }()
+	if off < 0 || size <= 0 {
 		err = syscall.EINVAL
 		return
 	}
@@ -684,7 +830,7 @@ func (v *VFS) Fallocate(ctx Context, ino Ino, mode uint8, off, length int64, fh 
 		err = syscall.EBADF
 		return
 	}
-	if off >= maxFileSize || off+length >= maxFileSize {
+	if off >= maxFileSize || off+size >= maxFileSize {
 		err = syscall.EFBIG
 		return
 	}
@@ -699,7 +845,23 @@ func (v *VFS) Fallocate(ctx Context, ino Ino, mode uint8, off, length int64, fh 
 	defer h.Wunlock()
 	defer h.removeOp(ctx)
 
-	err = v.Meta.Fallocate(ctx, ino, mode, uint64(off), uint64(length))
+	err = v.writer.Flush(ctx, ino)
+	if err != 0 {
+		return
+	}
+	var length uint64
+	err = v.Meta.Fallocate(ctx, ino, mode, uint64(off), uint64(size), &length)
+	if err == 0 {
+		v.writer.Truncate(ino, length)
+		s := size
+		if off+size > int64(length) {
+			s = int64(length) - off
+		}
+		if s > 0 {
+			v.reader.Invalidate(ino, uint64(off), uint64(s))
+		}
+		v.invalidateAttr(ino)
+	}
 	return
 }
 
@@ -761,14 +923,20 @@ func (v *VFS) CopyFileRange(ctx Context, nodeIn Ino, fhIn, offIn uint64, nodeOut
 		defer hi.removeOp(ctx)
 	}
 
+	err = v.writer.Flush(ctx, nodeIn)
+	if err != 0 {
+		return
+	}
 	err = v.writer.Flush(ctx, nodeOut)
 	if err != 0 {
 		return
 	}
-	err = v.Meta.CopyFileRange(ctx, nodeIn, offIn, nodeOut, offOut, size, flags, &copied)
+	var length uint64
+	err = v.Meta.CopyFileRange(ctx, nodeIn, offIn, nodeOut, offOut, size, flags, &copied, &length)
 	if err == 0 {
+		v.writer.Truncate(nodeOut, length)
 		v.reader.Invalidate(nodeOut, offOut, size)
-		v.invalidateLength(nodeOut)
+		v.invalidateAttr(nodeOut)
 	}
 	return
 }
@@ -808,6 +976,9 @@ func (v *VFS) Flush(ctx Context, ino Ino, fh uint64, lockOwner uint64) (err sysc
 
 	h.Lock()
 	locks := h.locks
+	if lockOwner == h.ofdOwner {
+		h.ofdOwner = 0
+	}
 	h.Unlock()
 	if locks&2 != 0 {
 		_ = v.Meta.Setlk(ctx, ino, lockOwner, false, F_UNLCK, 0, 0x7FFFFFFFFFFFFFFF, 0)
@@ -871,11 +1042,23 @@ func (v *VFS) SetXattr(ctx Context, ino Ino, name string, value []byte, flags ui
 		err = syscall.EINVAL
 		return
 	}
-	if name == "system.posix_acl_access" || name == "system.posix_acl_default" {
-		err = syscall.ENOTSUP
-		return
+
+	aclType := GetACLType(name)
+	if aclType != acl.TypeNone {
+		if !v.Conf.Format.EnableACL {
+			err = syscall.ENOTSUP
+			return
+		}
+
+		var rule *acl.Rule
+		rule, err = decodeACL(value)
+		if err != 0 {
+			return
+		}
+		err = v.Meta.SetFacl(ctx, ino, aclType, rule)
+	} else {
+		err = v.Meta.SetXattr(ctx, ino, name, value, flags)
 	}
-	err = v.Meta.SetXattr(ctx, ino, name, value, flags)
 	return
 }
 
@@ -897,11 +1080,22 @@ func (v *VFS) GetXattr(ctx Context, ino Ino, name string, size uint32) (value []
 		err = syscall.EINVAL
 		return
 	}
-	if name == "system.posix_acl_access" || name == "system.posix_acl_default" {
-		err = syscall.ENOTSUP
-		return
+
+	aclType := GetACLType(name)
+	if aclType != acl.TypeNone {
+		if !v.Conf.Format.EnableACL {
+			err = syscall.ENOTSUP
+			return
+		}
+
+		rule := &acl.Rule{}
+		if err = v.Meta.GetFacl(ctx, ino, aclType, rule); err != 0 {
+			return nil, err
+		}
+		value = encodeACL(rule)
+	} else {
+		err = v.Meta.GetXattr(ctx, ino, name, &value)
 	}
-	err = v.Meta.GetXattr(ctx, ino, name, &value)
 	if size > 0 && len(value) > int(size) {
 		err = syscall.ERANGE
 	}
@@ -927,9 +1121,6 @@ func (v *VFS) RemoveXattr(ctx Context, ino Ino, name string) (err syscall.Errno)
 		err = syscall.EPERM
 		return
 	}
-	if name == "system.posix_acl_access" || name == "system.posix_acl_default" {
-		return syscall.ENOTSUP
-	}
 	if len(name) > xattrMaxName {
 		if runtime.GOOS == "darwin" {
 			err = syscall.EPERM
@@ -942,7 +1133,18 @@ func (v *VFS) RemoveXattr(ctx Context, ino Ino, name string) (err syscall.Errno)
 		err = syscall.EINVAL
 		return
 	}
-	err = v.Meta.RemoveXattr(ctx, ino, name)
+
+	aclType := GetACLType(name)
+	if aclType != acl.TypeNone {
+		if !v.Conf.Format.EnableACL {
+			err = syscall.ENOTSUP
+			return
+		}
+		err = v.Meta.SetFacl(ctx, ino, aclType, acl.EmptyRule())
+	} else {
+		err = v.Meta.RemoveXattr(ctx, ino, name)
+	}
+
 	return
 }
 
@@ -957,9 +1159,10 @@ type VFS struct {
 	reader          DataReader
 	writer          DataWriter
 
-	handles map[Ino][]*handle
-	hanleM  sync.Mutex
-	nextfh  uint64
+	handles   map[Ino][]*handle
+	handleIno map[uint64]Ino
+	hanleM    sync.Mutex
+	nextfh    uint64
 
 	modM       sync.Mutex
 	modifiedAt map[Ino]time.Time
@@ -982,6 +1185,7 @@ func NewVFS(conf *Config, m meta.Meta, store chunk.ChunkStore, registerer promet
 		reader:     reader,
 		writer:     writer,
 		handles:    make(map[Ino][]*handle),
+		handleIno:  make(map[uint64]Ino),
 		modifiedAt: make(map[meta.Ino]time.Time),
 		nextfh:     1,
 		registry:   registry,
@@ -1001,12 +1205,21 @@ func NewVFS(conf *Config, m meta.Meta, store chunk.ChunkStore, registerer promet
 		meta.TrashName = ".jfs" + meta.TrashName
 	}
 
+	statePath := os.Getenv("_FUSE_STATE_PATH")
+	if statePath == "" {
+		statePath = fmt.Sprintf("/tmp/state%d.json", os.Getppid())
+	}
+
+	if err := v.loadAllHandles(statePath); err != nil && !os.IsNotExist(err) {
+		logger.Errorf("load state from %s: %s", statePath, err)
+	}
+
 	go v.cleanupModified()
 	initVFSMetrics(v, writer, reader, registerer)
 	return v
 }
 
-func (v *VFS) invalidateLength(ino Ino) {
+func (v *VFS) invalidateAttr(ino Ino) {
 	v.modM.Lock()
 	v.modifiedAt[ino] = time.Now()
 	v.modM.Unlock()
@@ -1037,6 +1250,21 @@ func (v *VFS) cleanupModified() {
 		v.modM.Unlock()
 		time.Sleep(time.Millisecond * time.Duration(1000*(cnt+1-deleted*2)/(cnt+1)))
 	}
+}
+
+func (v *VFS) FlushAll(path string) (err error) {
+	now := time.Now()
+	defer func() {
+		logger.Infof("flush buffered data in %s: %s", time.Since(now), err)
+	}()
+	err = v.writer.FlushAll()
+	if err != nil {
+		return err
+	}
+	if path == "" {
+		return nil
+	}
+	return v.dumpAllHandles(path)
 }
 
 func initVFSMetrics(v *VFS, writer DataWriter, reader DataReader, registerer prometheus.Registerer) {
@@ -1092,4 +1320,103 @@ func InitMetrics(registerer prometheus.Registerer) {
 	registerer.MustRegister(writtenSizeHistogram)
 	registerer.MustRegister(opsDurationsHistogram)
 	registerer.MustRegister(compactSizeHistogram)
+}
+
+// Linux ACL format:
+//
+//	version:8 (2)
+//	flags:8 (0)
+//	filler:16
+//	N * [ tag:16 perm:16 id:32 ]
+//	tag:
+//	  01 - user
+//	  02 - named user
+//	  04 - group
+//	  08 - named group
+//	  10 - mask
+//	  20 - other
+
+func encodeACL(n *acl.Rule) []byte {
+	length := 4 + 24 + uint32(len(n.NamedUsers)+len(n.NamedGroups))*8
+	if n.Mask != 0xFFFF {
+		length += 8
+	}
+	buff := make([]byte, length)
+	w := utils.NewNativeBuffer(buff)
+	w.Put8(acl.Version) // version
+	w.Put8(0)           // flag
+	w.Put16(0)          // filler
+	wRule := func(tag, perm uint16, id uint32) {
+		w.Put16(tag)
+		w.Put16(perm)
+		w.Put32(id)
+	}
+	wRule(1, n.Owner, 0xFFFFFFFF)
+	for _, rule := range n.NamedUsers {
+		wRule(2, rule.Perm, rule.Id)
+	}
+	wRule(4, n.Group, 0xFFFFFFFF)
+	for _, rule := range n.NamedGroups {
+		wRule(8, rule.Perm, rule.Id)
+	}
+	if n.Mask != 0xFFFF {
+		wRule(0x10, n.Mask, 0xFFFFFFFF)
+	}
+	wRule(0x20, n.Other, 0xFFFFFFFF)
+	return buff
+}
+
+func decodeACL(buff []byte) (*acl.Rule, syscall.Errno) {
+	length := len(buff)
+	if length < 4 || ((length % 8) != 4) || buff[0] != acl.Version {
+		return nil, syscall.EINVAL
+	}
+
+	n := acl.EmptyRule()
+	r := utils.NewNativeBuffer(buff[4:])
+	for r.HasMore() {
+		tag := r.Get16()
+		perm := r.Get16()
+		id := r.Get32()
+		switch tag {
+		case 1:
+			if n.Owner != 0xFFFF {
+				return nil, syscall.EINVAL
+			}
+			n.Owner = perm
+		case 2:
+			n.NamedUsers = append(n.NamedUsers, acl.Entry{Id: id, Perm: perm})
+		case 4:
+			if n.Group != 0xFFFF {
+				return nil, syscall.EINVAL
+			}
+			n.Group = perm
+		case 8:
+			n.NamedGroups = append(n.NamedGroups, acl.Entry{Id: id, Perm: perm})
+		case 0x10:
+			if n.Mask != 0xFFFF {
+				return nil, syscall.EINVAL
+			}
+			n.Mask = perm
+		case 0x20:
+			if n.Other != 0xFFFF {
+				return nil, syscall.EINVAL
+			}
+			n.Other = perm
+		}
+	}
+	if n.Mask == 0xFFFF && len(n.NamedUsers)+len(n.NamedGroups) > 0 {
+		return nil, syscall.EINVAL
+	}
+	return n, 0
+}
+
+func GetACLType(name string) uint8 {
+	switch name {
+	case "system.posix_acl_access":
+		return acl.TypeAccess
+	case "system.posix_acl_default":
+		return acl.TypeDefault
+	}
+	return acl.TypeNone
 }

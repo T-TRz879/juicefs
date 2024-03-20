@@ -126,7 +126,7 @@ func testStorage(t *testing.T, s ObjectStorage) {
 		}
 	}()
 
-	key := "测试编码文件" + `{"name":"zhijian"}` + string('\u001F')
+	key := "测试编码文件" + `{"name":"juicefs"}` + string('\u001F') + "%uFF081%uFF09.jpg"
 	if err := s.Put(key, bytes.NewReader(nil)); err != nil {
 		t.Logf("PUT testEncodeFile failed: %s", err.Error())
 	} else {
@@ -309,7 +309,7 @@ func testStorage(t *testing.T, s ObjectStorage) {
 		}
 	} else {
 		if len(obs) != 2 {
-			t.Fatalf("list with delimiter should return three results but got %d", len(obs))
+			t.Fatalf("list with delimiter should return two results but got %d", len(obs))
 		}
 		keys := []string{"a/", "a1"}
 		for i, o := range obs {
@@ -698,15 +698,6 @@ func TestJSS(t *testing.T) { //skip mutate
 	testStorage(t, jss)
 }
 
-func TestSpeedy(t *testing.T) { //skip mutate
-	if os.Getenv("SPEEDY_ACCESS_KEY") == "" {
-		t.SkipNow()
-	}
-	cos, _ := newSpeedy(os.Getenv("SPEEDY_ENDPOINT"),
-		os.Getenv("SPEEDY_ACCESS_KEY"), os.Getenv("SPEEDY_SECRET_KEY"), "")
-	testStorage(t, cos)
-}
-
 func TestB2(t *testing.T) { //skip mutate
 	if os.Getenv("B2_ACCOUNT_ID") == "" {
 		t.SkipNow()
@@ -749,6 +740,17 @@ func TestOBS(t *testing.T) { //skip mutate
 	}
 	b, _ := newOBS(os.Getenv("HWCLOUD_ENDPOINT"),
 		os.Getenv("HWCLOUD_ACCESS_KEY"), os.Getenv("HWCLOUD_SECRET_KEY"), "")
+	testStorage(t, b)
+}
+
+func TestNFS(t *testing.T) { //skip mutate
+	if os.Getenv("NFS_ADDR") == "" {
+		t.SkipNow()
+	}
+	b, err := newNFSStore(os.Getenv("NFS_ADDR"), os.Getenv("NFS_ACCESS_KEY"), os.Getenv("NFS_SECRET_KEY"), "")
+	if err != nil {
+		t.Fatal(err)
+	}
 	testStorage(t, b)
 }
 
@@ -1012,6 +1014,17 @@ func TestTOS(t *testing.T) { //skip mutate
 		t.Fatalf("create: %s", err)
 	}
 	testStorage(t, tos)
+}
+
+func TestDragonfly(t *testing.T) { //skip mutate
+	if os.Getenv("DRAGONFLY_ENDPOINT") == "" {
+		t.SkipNow()
+	}
+	dragonfly, err := newDragonfly(os.Getenv("DRAGONFLY_ENDPOINT"), "", "", "")
+	if err != nil {
+		t.Fatalf("create: %s", err)
+	}
+	testStorage(t, dragonfly)
 }
 
 func TestMain(m *testing.M) {

@@ -56,6 +56,7 @@ GLOBAL OPTIONS:
    --verbose, --debug, -v  enable debug log (default: false)
    --quiet, -q             show warning and errors only (default: false)
    --trace                 enable trace log (default: false)
+   --log-id value          append the given log id in log, use "random" to use random uuid
    --no-agent              disable pprof (:6060) agent (default: false)
    --pyroscope value       pyroscope address
    --no-color              disable colors (default: false)
@@ -155,7 +156,7 @@ juicefs format sqlite3://myjfs.db myjfs --trash-days=0
 
 |Items|Description|
 |-|-|
-|`--storage=file`|Object storage type (e.g. `s3`, `gcs`, `oss`, `cos`) (default: `file`, refer to [documentation](../reference/how_to_set_up_object_storage.md#supported-object-storage) for all supported object storage types)|
+|`--storage=file`|Object storage type (e.g. `s3`, `gs`, `oss`, `cos`) (default: `file`, refer to [documentation](../reference/how_to_set_up_object_storage.md#supported-object-storage) for all supported object storage types)|
 |`--bucket=/var/jfs`|A bucket URL to store data (default: `$HOME/.juicefs/local` or `/var/jfs`)|
 |`--access-key=value`|Access Key for object storage (can also be set via the environment variable `ACCESS_KEY`), see [How to Set Up Object Storage](../reference/how_to_set_up_object_storage.md#aksk) for more.|
 |`--secret-key value`|Secret Key for object storage (can also be set via the environment variable `SECRET_KEY`), see [How to Set Up Object Storage](../reference/how_to_set_up_object_storage.md#aksk) for more.|
@@ -167,10 +168,10 @@ juicefs format sqlite3://myjfs.db myjfs --trash-days=0
 |Items|Description|
 |-|-|
 |`--block-size=4096`|size of block in KiB (default: 4096). 4M is usually a better default value because many object storage services use 4M as their internal block size, thus using the same block size in JuiceFS usually yields better performance.|
-|`--compress=none`|compression algorithm, choose from `lz4`, `zstd`, `none` (default). Enabling compression will inevitably affect performance, choose wisely.|
+|`--compress=none`|compression algorithm, choose from `lz4`, `zstd`, `none` (default). Enabling compression will inevitably affect performance. Among the two supported algorithms, `lz4` offers a better performance, while `zstd` comes with a higher compression ratio, Google for their detailed comparison.|
 |`--encrypt-rsa-key=value`|A path to RSA private key (PEM)|
 |`--encrypt-algo=aes256gcm-rsa`|encrypt algorithm (aes256gcm-rsa, chacha20-rsa) (default: "aes256gcm-rsa")|
-|`--hash-prefix`|add a hash prefix to name of objects (default: false)|
+|`--hash-prefix`|For most object storages, if object storage blocks are sequentially named, they will also be closely stored in the underlying physical regions. When loaded with intensive concurrent consecutive reads, this can cause hotspots and hinder object storage performance.<br/><br/>Enabling `--hash-prefix` will add a hash prefix to name of the blocks (slice ID mod 256, see [internal implementation](../development/internals.md#object-storage-naming-format)), this distributes data blocks evenly across actual object storage regions, offering more consistent performance. Obviously, this option dictates object naming pattern and **should be specified when a file system is created, and cannot be changed on-the-fly.**<br/><br/>Currently, [AWS S3](https://aws.amazon.com/about-aws/whats-new/2018/07/amazon-s3-announces-increased-request-rate-performance) had already made improvements and no longer require application side optimization, but for other types of object storages, this option still recommended for large scale scenarios.|
 |`--shards=0`|If your object storage limit speed in a bucket level (or you're using a self-hosted object storage with limited performance), you can store the blocks into N buckets by hash of key (default: 0), when N is greater than 0, `bucket` should to be in the form of `%d`, e.g. `--bucket "juicefs-%d"`. `--shards` cannot be changed afterwards and must be planned carefully ahead.|
 
 #### Management options {#format-management-options}
@@ -180,6 +181,7 @@ juicefs format sqlite3://myjfs.db myjfs --trash-days=0
 |`--capacity=0`|storage space limit in GiB, default to 0 which means no limit. Capacity will include trash files, if [trash](../security/trash.md) is enabled.|
 |`--inodes=0`|Limit the number of inodes, default to 0 which means no limit.|
 |`--trash-days=1`|By default, delete files are put into [trash](../security/trash.md), this option controls the number of days before trash files are expired, default to 1, set to 0 to disable trash.|
+|`--enable-acl=true` <VersionAdd>1.2</VersionAdd>|enable [POSIX ACL](../security/posix_acl.md)，it is irreversible. |
 
 ### `juicefs config` {#config}
 
@@ -214,7 +216,7 @@ juicefs config redis://localhost --min-client-version 1.0.0 --max-client-version
 
 |Items|Description|
 |-|-|
-|`--storage=file` <VersionAdd>1.1</VersionAdd> |Object storage type (e.g. `s3`, `gcs`, `oss`, `cos`) (default: `"file"`, refer to [documentation](../reference/how_to_set_up_object_storage.md#supported-object-storage) for all supported object storage types).|
+|`--storage=file` <VersionAdd>1.1</VersionAdd> |Object storage type (e.g. `s3`, `gs`, `oss`, `cos`) (default: `"file"`, refer to [documentation](../reference/how_to_set_up_object_storage.md#supported-object-storage) for all supported object storage types).|
 |`--bucket=/var/jfs`|A bucket URL to store data (default: `$HOME/.juicefs/local` or `/var/jfs`)|
 |`--access-key=value`|Access Key for object storage (can also be set via the environment variable `ACCESS_KEY`), see [How to Set Up Object Storage](../reference/how_to_set_up_object_storage.md#aksk) for more.|
 |`--secret-key value`|Secret Key for object storage (can also be set via the environment variable `SECRET_KEY`), see [How to Set Up Object Storage](../reference/how_to_set_up_object_storage.md#aksk) for more.|
@@ -234,6 +236,7 @@ juicefs config redis://localhost --min-client-version 1.0.0 --max-client-version
 |`--min-client-version value` <VersionAdd>1.1</VersionAdd> |minimum client version allowed to connect|
 |`--max-client-version value` <VersionAdd>1.1</VersionAdd> |maximum client version allowed to connect|
 |`--dir-stats` <VersionAdd>1.1</VersionAdd> |enable dir stats, which is necessary for fast summary and dir quota (default: false)|
+|`--enable-acl` <VersionAdd>1.2</VersionAdd>|enable POSIX ACL(irreversible), min-client-version will be set to v1.2|
 
 ### `juicefs quota` <VersionAdd>1.1</VersionAdd> {#quota}
 
@@ -383,6 +386,8 @@ juicefs dump redis://localhost sub-meta-dump.json --subdir /dir/in/jfs
 |`FILE`|Export file path, if not specified, it will be exported to standard output. If the filename ends with `.gz`, it will be automatically compressed.|
 |`--subdir=path`|Only export metadata for the specified subdirectory.|
 |`--keep-secret-key` <VersionAdd>1.1</VersionAdd> |Export object storage authentication information, the default is `false`. Since it is exported in plain text, pay attention to data security when using it. If the export file does not contain object storage authentication information, you need to use [`juicefs config`](#config) to reconfigure object storage authentication information after the subsequent import is completed.|
+|`--fast` <VersionAdd>1.2</VersionAdd>|Use more memory to speedup dump.|
+|`--skip-trash` <VersionAdd>1.2</VersionAdd>|Skip files and directories in trash.|
 
 ### `juicefs load` {#load}
 
@@ -627,6 +632,7 @@ juicefs mount redis://localhost /mnt/jfs --backup-meta 0
 |-|-|
 |`--subdir=value`|mount a sub-directory as root (default: "")|
 |`--backup-meta=3600`|interval (in seconds) to automatically backup metadata in the object storage (0 means disable backup) (default: "3600")|
+|`--backup-skip-trash` <VersionAdd>1.2</VersionAdd>|skip files and directories in trash when backup metadata.|
 |`--heartbeat=12`|interval (in seconds) to send heartbeat; it's recommended that all clients use the same heartbeat value (default: "12")|
 |`--read-only`|allow lookup/read operations only (default: false)|
 |`--no-bgjob`|Disable background jobs, default to false, which means clients by default carry out background jobs, including:<br/><ul><li>Clean up expired files in Trash (look for `cleanupDeletedFiles`, `cleanupTrash` in [`pkg/meta/base.go`](https://github.com/juicedata/juicefs/blob/main/pkg/meta/base.go))</li><li>Delete slices that's not referenced (look for `cleanupSlices` in [`pkg/meta/base.go`](https://github.com/juicedata/juicefs/blob/main/pkg/meta/base.go))</li><li>Clean up stale client sessions (look for `CleanStaleSessions` in [`pkg/meta/base.go`](https://github.com/juicedata/juicefs/blob/main/pkg/meta/base.go))</li></ul>Note that compaction isn't affected by this option, it happens automatically with file reads and writes, client will check if compaction is in need, and run in background (take Redis for example, look for `compactChunk` in [`pkg/meta/base.go`](https://github.com/juicedata/juicefs/blob/main/pkg/meta/redis.go)).|
@@ -649,7 +655,7 @@ For metadata cache description and usage, refer to [Kernel metadata cache](../gu
 
 |Items|Description|
 |-|-|
-|`--storage=file`|Object storage type (e.g. `s3`, `gcs`, `oss`, `cos`) (default: `"file"`, refer to [documentation](../reference/how_to_set_up_object_storage.md#supported-object-storage) for all supported object storage types).|
+|`--storage=file`|Object storage type (e.g. `s3`, `gs`, `oss`, `cos`) (default: `"file"`, refer to [documentation](../reference/how_to_set_up_object_storage.md#supported-object-storage) for all supported object storage types).|
 |`--storage-class value` <VersionAdd>1.1</VersionAdd> |the storage class for data written by current client|
 |`--bucket=value`|customized endpoint to access object storage|
 |`--get-timeout=60`|the max number of seconds to download an object (default: 60)|
@@ -666,12 +672,12 @@ For metadata cache description and usage, refer to [Kernel metadata cache](../gu
 |-|-|
 |`--buffer-size=300`|total read/write buffering in MiB (default: 300), see [Read/Write buffer](../guide/cache.md#buffer-size)|
 |`--prefetch=1`|prefetch N blocks in parallel (default: 1), see [Client read data cache](../guide/cache.md#client-read-cache)|
-|`--writeback`|upload objects in background (default: false), see [Client write data cache](../guide/cache.md#writeback)|
-|`--upload-delay=0`|When `--writeback` is enabled, you can use this option to add a delay to object storage upload, default to 0, meaning that upload will begin immediately after write. Different units are supported, including `s` (second), `m` (minute), `h` (hour). If files are deleted during this delay, upload will be skipped entirely, when using JuiceFS for temporary storage, use this option to reduce resource usage. Refer to [Client write data cache](../guide/cache.md#writeback).|
+|`--writeback`|upload objects in background (default: false), see [Client write data cache](../guide/cache.md#client-write-cache)|
+|`--upload-delay=0`|When `--writeback` is enabled, you can use this option to add a delay to object storage upload, default to 0, meaning that upload will begin immediately after write. Different units are supported, including `s` (second), `m` (minute), `h` (hour). If files are deleted during this delay, upload will be skipped entirely, when using JuiceFS for temporary storage, use this option to reduce resource usage. Refer to [Client write data cache](../guide/cache.md#client-write-cache).|
 |`--cache-dir=value`|directory paths of local cache, use `:` (Linux, macOS) or `;` (Windows) to separate multiple paths (default: `$HOME/.juicefs/cache` or `/var/jfsCache`), see [Client read data cache](../guide/cache.md#client-read-cache)|
 |`--cache-mode value` <VersionAdd>1.1</VersionAdd> |file permissions for cached blocks (default: "0600")|
 |`--cache-size=102400`|size of cached object for read in MiB (default: 102400), see [Client read data cache](../guide/cache.md#client-read-cache)|
-|`--free-space-ratio=0.1`|min free space ratio (default: 0.1), if [Client write data cache](../guide/cache.md#writeback) is enabled, this option also controls write cache size, see [Client read data cache](../guide/cache.md#client-read-cache)|
+|`--free-space-ratio=0.1`|min free space ratio (default: 0.1), if [Client write data cache](../guide/cache.md#client-write-cache) is enabled, this option also controls write cache size, see [Client read data cache](../guide/cache.md#client-read-cache)|
 |`--cache-partial-only`|cache random/small read only (default: false), see [Client read data cache](../guide/cache.md#client-read-cache)|
 |`--verify-cache-checksum value` <VersionAdd>1.1</VersionAdd> |Checksum level for cache data. After enabled, checksum will be calculated on divided parts of the cache blocks and stored on disks, which are used for verification during reads. The following strategies are supported:<br/><ul><li>`none`: Disable checksum verification, if local cache data is tampered, bad data will be read;</li><li>`full` (default): Perform verification when reading the full block, use this for sequential read scenarios;</li><li>`shrink`: Perform verification on parts that's fully included within the read range, use this for random read scenarios;</li><li>`extend`: Perform verification on parts that fully include the read range, this causes read amplifications and is only used for random read scenarios demanding absolute data integrity.</li></ul>|
 |`--cache-eviction value` <VersionAdd>1.1</VersionAdd> |cache eviction policy (none or 2-random) (default: "2-random")|
@@ -682,6 +688,7 @@ For metadata cache description and usage, refer to [Kernel metadata cache](../gu
 ||Items|Description|
 |-|-|
 |`--metrics=127.0.0.1:9567`|address to export metrics (default: `127.0.0.1:9567`)|
+|`--custom-labels`|custom labels for metrics, format: `key1:value1,key2:value2` (default: "")|
 |`--consul=127.0.0.1:8500`|Consul address to register (default: `127.0.0.1:8500`)|
 |`--no-usage-report`|do not send usage report (default: false)|
 
@@ -724,13 +731,16 @@ Apart from options listed below, this command shares options with `juicefs mount
 
 |Items|Description|
 |-|-|
+| `--log value`<VersionAdd>1.2</VersionAdd>      | path for gateway log                                                                                   |
 |`META-URL`|Database URL for metadata storage, see [JuiceFS supported metadata engines](../reference/how_to_set_up_metadata_engine.md) for details.|
 |`ADDRESS`|S3 gateway address and listening port, for example: `localhost:9000`|
 |`--access-log=path`|path for JuiceFS access log.|
+| `--background, -d`<VersionAdd>1.2</VersionAdd> | run in background (default: false)                                                               |
 |`--no-banner`|disable MinIO startup information (default: false)|
 |`--multi-buckets`|use top level of directories as buckets (default: false)|
 |`--keep-etag`|save the ETag for uploaded objects (default: false)|
 |`--umask=022`|umask for new file and directory in octal (default: 022)|
+| `--domain value`<VersionAdd>1.2</VersionAdd>   |domain for virtual-host-style requests|
 
 ### `juicefs webdav` {#webdav}
 
@@ -756,7 +766,9 @@ Apart from options listed below, this command shares options with `juicefs mount
 |`--key-file` <VersionAdd>1.1</VersionAdd> |key file for HTTPS|
 |`--gzip`|compress served files via gzip (default: false)|
 |`--disallowList`|disallow list a directory (default: false)|
+| `--log value`<VersionAdd>1.2</VersionAdd>      | path for WebDAV log|
 |`--access-log=path`|path for JuiceFS access log.|
+| `--background, -d`<VersionAdd>1.2</VersionAdd> | run in background (default: false)|
 
 ## Tool {#tool}
 
@@ -804,7 +816,7 @@ ACCESS_KEY=myAccessKey SECRET_KEY=mySecretKey juicefs objbench --storage=s3 http
 
 |Items|Description|
 |-|-|
-|`--storage=file`|Object storage type (e.g. `s3`, `gcs`, `oss`, `cos`) (default: `file`, refer to [documentation](../reference/how_to_set_up_object_storage.md#supported-object-storage) for all supported object storage types)|
+|`--storage=file`|Object storage type (e.g. `s3`, `gs`, `oss`, `cos`) (default: `file`, refer to [documentation](../reference/how_to_set_up_object_storage.md#supported-object-storage) for all supported object storage types)|
 |`--access-key=value`|Access Key for object storage (can also be set via the environment variable `ACCESS_KEY`), see [How to Set Up Object Storage](../reference/how_to_set_up_object_storage.md#aksk) for more.|
 |`--secret-key value`|Secret Key for object storage (can also be set via the environment variable `SECRET_KEY`), see [How to Set Up Object Storage](../reference/how_to_set_up_object_storage.md#aksk) for more.|
 |`--block-size=4096`|size of each IO block in KiB (default: 4096)|
@@ -878,7 +890,7 @@ juicefs sync --exclude='a?/b*' s3://mybucket.s3.us-east-2.amazonaws.com/ jfs://M
 # SRC: a1/b1,a2/b2,aaa/b1   DST: empty   sync result: a1/b1,aaa/b1
 juicefs sync --include='a1/b1' --exclude='a[1-9]/b*' s3://mybucket.s3.us-east-2.amazonaws.com/ jfs://META-URL/
 
-# SRC: a1/b1,a2/b2,aaa/b1,b1,b2  DST: empty   sync result: a1/b1,b2
+# SRC: a1/b1,a2/b2,aaa/b1,b1,b2  DST: empty   sync result: b2
 juicefs sync --include='a1/b1' --exclude='a*' --include='b2' --exclude='b?' s3://mybucket.s3.us-east-2.amazonaws.com/ jfs://META-URL/
 ```
 

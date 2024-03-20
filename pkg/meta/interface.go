@@ -22,11 +22,13 @@ import (
 	"io"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"syscall"
 	"time"
 
+	aclAPI "github.com/juicedata/juicefs/pkg/acl"
 	"github.com/juicedata/juicefs/pkg/utils"
 	"github.com/prometheus/client_golang/prometheus"
 )
@@ -52,6 +54,8 @@ const (
 	Clone = 1006
 	// OpSummary is a message to get tree summary of directories.
 	OpSummary = 1007
+	// CompactPath is a message to trigger compact
+	CompactPath = 1008
 )
 
 const (
@@ -101,8 +105,29 @@ const (
 )
 
 const MaxName = 255
+const MaxSymlink = 4096
+
+type Ino uint64
+
 const RootInode Ino = 1
 const TrashInode Ino = 0x7FFFFFFF10000000 // larger than vfs.minInternalNode
+
+func (i Ino) String() string {
+	return strconv.FormatUint(uint64(i), 10)
+}
+
+func (i Ino) IsValid() bool {
+	return i >= RootInode
+}
+
+func (i Ino) IsTrash() bool {
+	return i >= TrashInode
+}
+
+func (i Ino) IsNormal() bool {
+	return i >= RootInode && i < TrashInode
+}
+
 var TrashName = ".trash"
 
 func isTrash(ino Ino) bool {
@@ -141,6 +166,9 @@ type Attr struct {
 	Parent    Ino  // inode of parent; 0 means tracked by parentKey (for hardlinks)
 	Full      bool // the attributes are completed or not
 	KeepCache bool // whether to keep the cached page or not
+
+	AccessACL  uint32 // access ACL id (identical ACL rules share the same access ACL ID.)
+	DefaultACL uint32 // default ACL id (default ACL and the access ACL share the same cache and store)
 }
 
 func typeToStatType(_type uint8) uint32 {
@@ -251,6 +279,7 @@ type SessionInfo struct {
 	HostName   string
 	IPAddrs    []string `json:",omitempty"`
 	MountPoint string
+	MountTime  time.Time
 	ProcessID  int
 }
 
@@ -316,7 +345,7 @@ type Meta interface {
 	Reset() error
 	// Load loads the existing setting of a formatted volume from meta service.
 	Load(checkVersion bool) (*Format, error)
-	// NewSession creates a new client session.
+	// NewSession creates or update client session.
 	NewSession(record bool) error
 	// CloseSession does cleanup and close the session.
 	CloseSession() error
@@ -354,7 +383,7 @@ type Meta interface {
 	// Truncate changes the length for given file.
 	Truncate(ctx Context, inode Ino, flags uint8, attrlength uint64, attr *Attr, skipPermCheck bool) syscall.Errno
 	// Fallocate preallocate given space for given file.
-	Fallocate(ctx Context, inode Ino, mode uint8, off uint64, size uint64) syscall.Errno
+	Fallocate(ctx Context, inode Ino, mode uint8, off uint64, size uint64, length *uint64) syscall.Errno
 	// ReadLink returns the target of a symlink.
 	ReadLink(ctx Context, inode Ino, path *[]byte) syscall.Errno
 	// Symlink creates a symlink in a directory with given name.
@@ -391,7 +420,7 @@ type Meta interface {
 	// InvalidateChunkCache invalidate chunk cache
 	InvalidateChunkCache(ctx Context, inode Ino, indx uint32) syscall.Errno
 	// CopyFileRange copies part of a file to another one.
-	CopyFileRange(ctx Context, fin Ino, offIn uint64, fout Ino, offOut uint64, size uint64, flags uint32, copied *uint64) syscall.Errno
+	CopyFileRange(ctx Context, fin Ino, offIn uint64, fout Ino, offOut uint64, size uint64, flags uint32, copied, outLength *uint64) syscall.Errno
 	// GetParents returns a map of node parents (> 1 parents if hardlinked)
 	GetParents(ctx Context, inode Ino) map[Ino]int
 	// GetDirStat returns the space and inodes usage of a directory.
@@ -414,9 +443,13 @@ type Meta interface {
 
 	// Compact all the chunks by merge small slices together
 	CompactAll(ctx Context, threads int, bar *utils.Bar) syscall.Errno
+	// Compact chunks for specified path
+	Compact(ctx Context, inode Ino, concurrency int, preFunc, postFunc func()) syscall.Errno
+
 	// ListSlices returns all slices used by all files.
 	ListSlices(ctx Context, slices map[Ino][]Slice, delete bool, showProgress func()) syscall.Errno
 	// Remove all files and directories recursively.
+	// count represents the number of attempted deletions of entries (even if failed).
 	Remove(ctx Context, parent Ino, name string, count *uint64) syscall.Errno
 	// Get summary of a node; for a directory it will accumulate all its child nodes
 	GetSummary(ctx Context, inode Ino, summary *Summary, recursive bool, strict bool) syscall.Errno
@@ -443,12 +476,15 @@ type Meta interface {
 	HandleQuota(ctx Context, cmd uint8, dpath string, quotas map[string]*Quota, strict, repair bool) error
 
 	// Dump the tree under root, which may be modified by checkRoot
-	DumpMeta(w io.Writer, root Ino, keepSecret bool) error
+	DumpMeta(w io.Writer, root Ino, keepSecret, fast, skipTrash bool) error
 	LoadMeta(r io.Reader) error
 
 	// getBase return the base engine.
 	getBase() *baseMeta
 	InitMetrics(registerer prometheus.Registerer)
+
+	SetFacl(ctx Context, ino Ino, aclType uint8, n *aclAPI.Rule) syscall.Errno
+	GetFacl(ctx Context, ino Ino, aclType uint8, n *aclAPI.Rule) syscall.Errno
 }
 
 type Creator func(driver, addr string, conf *Config) (Meta, error)

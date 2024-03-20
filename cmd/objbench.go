@@ -25,6 +25,7 @@ import (
 	"os"
 	"os/user"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -59,7 +60,7 @@ Details: https://juicefs.com/docs/community/performance_evaluation_guide#juicefs
 			&cli.StringFlag{
 				Name:  "storage",
 				Value: "file",
-				Usage: "object storage type (e.g. s3, gcs, oss, cos)",
+				Usage: "object storage type (e.g. s3, gs, oss, cos)",
 			},
 			&cli.StringFlag{
 				Name:  "access-key",
@@ -167,17 +168,18 @@ func objbench(ctx *cli.Context) error {
 		pass = fmt.Sprintf("%s%dm%s%s", COLOR_SEQ, GREEN, pass, RESET_SEQ)
 		failed = fmt.Sprintf("%s%dm%s%s", COLOR_SEQ, RED, failed, RESET_SEQ)
 	}
-	nobody, err := user.Lookup("nobody")
-	if err != nil {
-		logger.Fatalf("lookup nobody user failed: %v", err)
-	} else {
-		group, err := user.LookupGroupId(nobody.Gid)
+	if runtime.GOOS != "windows" {
+		nobody, err := user.Lookup("nobody")
 		if err != nil {
-			logger.Fatalf("lookup nobody's group failed: %v", err)
+			logger.Fatalf("lookup nobody user failed: %v", err)
+		} else {
+			group, err := user.LookupGroupId(nobody.Gid)
+			if err != nil {
+				logger.Fatalf("lookup nobody's group failed: %v", err)
+			}
+			groupName = group.Name
 		}
-		groupName = group.Name
 	}
-
 	if ctx.Bool("skip-functional-tests") {
 		if err := blob.Create(); err != nil {
 			return fmt.Errorf("can't create bucket: %s", err)
@@ -601,6 +603,7 @@ func listAll(s object.ObjectStorage, prefix, marker string, limit int64) ([]obje
 }
 
 var syncTests = map[string]bool{
+	"special key":         true,
 	"put a big object":    true,
 	"put an empty object": true,
 	"multipart upload":    true,
@@ -650,6 +653,7 @@ func functionalTesting(blob object.ObjectStorage, result *[][]string, colorful b
 		if err != nil {
 			return "", err
 		}
+		defer r.Close()
 		data, err := io.ReadAll(r)
 		if err != nil {
 			return "", err
@@ -890,7 +894,7 @@ func functionalTesting(blob object.ObjectStorage, result *[][]string, colorful b
 	})
 
 	runCase("special key", func(blob object.ObjectStorage) error {
-		key := "测试编码文件" + `{"name":"juicefs"}` + string('\u001F')
+		key := "测试编码文件" + `{"name":"juicefs"}` + string('\u001F') + "%uFF081%uFF09.jpg"
 		defer blob.Delete(key) //nolint:errcheck
 		if err := blob.Put(key, bytes.NewReader([]byte("1"))); err != nil {
 			return fmt.Errorf("put encode file failed: %s", err)

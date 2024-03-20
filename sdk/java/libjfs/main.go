@@ -31,6 +31,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"github.com/juicedata/juicefs/pkg/acl"
 	"io"
 	"net/http"
 	_ "net/http/pprof"
@@ -65,14 +66,15 @@ var (
 	openFiles  = make(map[int]*fwrapper)
 	nextHandle = 1
 
-	fslock   sync.Mutex
-	handlers = make(map[uintptr]*wrapper)
-	activefs = make(map[string][]*wrapper)
-	logger   = utils.GetLogger("juicefs")
-	bOnce    sync.Once
-	bridges  []*Bridge
-	pOnce    sync.Once
-	pushers  []*push.Pusher
+	fslock       sync.Mutex
+	handlers           = make(map[int64]*wrapper)
+	nextFsHandle int64 = 0
+	activefs           = make(map[string][]*wrapper)
+	logger             = utils.GetLogger("juicefs")
+	bOnce        sync.Once
+	bridges      []*Bridge
+	pOnce        sync.Once
+	pushers      []*push.Pusher
 )
 
 const (
@@ -278,6 +280,7 @@ type javaConf struct {
 	NoBGJob           bool    `json:"noBGJob"`
 	OpenCache         float64 `json:"openCache"`
 	BackupMeta        int64   `json:"backupMeta"`
+	BackupSkipTrash   bool    `json:"backupSkipTrash"`
 	Heartbeat         int     `json:"heartbeat"`
 	CacheDir          string  `json:"cacheDir"`
 	CacheSize         int64   `json:"cacheSize"`
@@ -287,6 +290,7 @@ type javaConf struct {
 	CacheChecksum     string  `json:"cacheChecksum"`
 	CacheEviction     string  `json:"cacheEviction"`
 	CacheScanInterval int     `json:"cacheScanInterval"`
+	CacheExpire       int64   `json:"cacheExpire"`
 	Writeback         bool    `json:"writeback"`
 	MemorySize        int     `json:"memorySize"`
 	Prefetch          int     `json:"prefetch"`
@@ -309,10 +313,11 @@ type javaConf struct {
 	PushGateway       string  `json:"pushGateway"`
 	PushInterval      int     `json:"pushInterval"`
 	PushAuth          string  `json:"pushAuth"`
+	PushLabels        string  `json:"pushLabels"`
 	PushGraphite      string  `json:"pushGraphite"`
 }
 
-func getOrCreate(name, user, group, superuser, supergroup string, f func() *fs.FileSystem) uintptr {
+func getOrCreate(name, user, group, superuser, supergroup string, f func() *fs.FileSystem) int64 {
 	fslock.Lock()
 	defer fslock.Unlock()
 	ws := activefs[name]
@@ -340,9 +345,9 @@ func getOrCreate(name, user, group, superuser, supergroup string, f func() *fs.F
 		w.ctx = meta.NewContext(uint32(os.Getpid()), w.lookupUid(user), w.lookupGids(group))
 	}
 	activefs[name] = append(ws, w)
-	h := uintptr(unsafe.Pointer(w)) & 0x7fffffff // low 32bits
-	handlers[h] = w
-	return h
+	nextFsHandle = nextFsHandle + 1
+	handlers[nextFsHandle] = w
+	return nextFsHandle
 }
 
 func push2Gateway(pushGatewayAddr, pushAuth string, pushInterVal time.Duration, registry *prometheus.Registry, commonLabels map[string]string) {
@@ -401,7 +406,7 @@ func push2Graphite(graphite string, pushInterVal time.Duration, registry *promet
 }
 
 //export jfs_init
-func jfs_init(cname, jsonConf, user, group, superuser, supergroup *C.char) uintptr {
+func jfs_init(cname, jsonConf, user, group, superuser, supergroup *C.char) int64 {
 	name := C.GoString(cname)
 	debug.SetGCPercent(50)
 	object.UserAgent = "JuiceFS-SDK " + version.Version()
@@ -454,6 +459,19 @@ func jfs_init(cname, jsonConf, user, group, superuser, supergroup *C.char) uintp
 			} else {
 				logger.Warnf("cannot get hostname: %s", err)
 			}
+			if jConf.PushLabels != "" {
+				for _, kv := range strings.Split(jConf.PushLabels, ",") {
+					var splited = strings.Split(kv, ":")
+					if len(splited) != 2 {
+						logger.Errorf("invalid label format: %s", kv)
+						return nil
+					}
+					if utils.StringContains([]string{"mp", "vol_name", "instance"}, splited[0]) {
+						logger.Warnf("overriding reserved label: %s", splited[0])
+					}
+					commonLabels[splited[0]] = splited[1]
+				}
+			}
 			registry := prometheus.NewRegistry()
 			registerer = prometheus.WrapRegistererWithPrefix("juicefs_", registry)
 			registerer.MustRegister(collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
@@ -471,7 +489,7 @@ func jfs_init(cname, jsonConf, user, group, superuser, supergroup *C.char) uintp
 			}
 			m.InitMetrics(registerer)
 			vfs.InitMetrics(registerer)
-			go metric.UpdateMetrics(m, registerer)
+			go metric.UpdateMetrics(registerer)
 		}
 
 		blob, err := cmd.NewReloadableStorage(format, m, func(f *meta.Format) {
@@ -504,6 +522,7 @@ func jfs_init(cname, jsonConf, user, group, superuser, supergroup *C.char) uintp
 			CacheChecksum:     jConf.CacheChecksum,
 			CacheEviction:     jConf.CacheEviction,
 			CacheScanInterval: time.Second * time.Duration(jConf.CacheScanInterval),
+			CacheExpire:       time.Second * time.Duration(jConf.CacheExpire),
 			MaxUpload:         jConf.MaxUploads,
 			MaxRetries:        jConf.IORetries,
 			UploadLimit:       int64(jConf.UploadLimit) * 1e6 / 8,
@@ -559,9 +578,10 @@ func jfs_init(cname, jsonConf, user, group, superuser, supergroup *C.char) uintp
 			AccessLog:       jConf.AccessLog,
 			FastResolve:     jConf.FastResolve,
 			BackupMeta:      time.Second * time.Duration(jConf.BackupMeta),
+			BackupSkipTrash: jConf.BackupSkipTrash,
 		}
 		if !jConf.ReadOnly && !jConf.NoSession && !jConf.NoBGJob && conf.BackupMeta > 0 {
-			go vfs.Backup(m, blob, conf.BackupMeta)
+			go vfs.Backup(m, blob, conf.BackupMeta, conf.BackupSkipTrash)
 		}
 		if !jConf.NoUsageReport && !jConf.NoSession {
 			go usage.ReportUsage(m, "java-sdk "+version.Version())
@@ -576,14 +596,14 @@ func jfs_init(cname, jsonConf, user, group, superuser, supergroup *C.char) uintp
 	})
 }
 
-func F(p uintptr) *wrapper {
+func F(p int64) *wrapper {
 	fslock.Lock()
 	defer fslock.Unlock()
 	return handlers[p]
 }
 
 //export jfs_update_uid_grouping
-func jfs_update_uid_grouping(h uintptr, uidstr *C.char, grouping *C.char) {
+func jfs_update_uid_grouping(h int64, uidstr *C.char, grouping *C.char) {
 	w := F(h)
 	if w == nil {
 		return
@@ -627,6 +647,11 @@ func jfs_update_uid_grouping(h uintptr, uidstr *C.char, grouping *C.char) {
 			}
 		}
 		logger.Debugf("Update groups of %s to %s", w.user, strings.Join(groups, ","))
+		var buffer bytes.Buffer
+		for _, g := range gids {
+			buffer.WriteString(fmt.Sprintf("\t%v:%v\n", g.name, g.id))
+		}
+		logger.Debugf("Update gids mapping\n %s", buffer.String())
 	}
 	w.m.update(uids, gids, false)
 
@@ -642,7 +667,7 @@ func jfs_update_uid_grouping(h uintptr, uidstr *C.char, grouping *C.char) {
 }
 
 //export jfs_term
-func jfs_term(pid int, h uintptr) int {
+func jfs_term(pid int, h int64) int {
 	w := F(h)
 	if w == nil {
 		return 0
@@ -700,7 +725,7 @@ func jfs_term(pid int, h uintptr) int {
 }
 
 //export jfs_open
-func jfs_open(pid int, h uintptr, cpath *C.char, lenPtr uintptr, flags int) int {
+func jfs_open(pid int, h int64, cpath *C.char, lenPtr uintptr, flags int) int {
 	w := F(h)
 	if w == nil {
 		return EINVAL
@@ -723,7 +748,7 @@ func jfs_open(pid int, h uintptr, cpath *C.char, lenPtr uintptr, flags int) int 
 }
 
 //export jfs_access
-func jfs_access(pid int, h uintptr, cpath *C.char, flags int) int {
+func jfs_access(pid int, h int64, cpath *C.char, flags int) int {
 	w := F(h)
 	if w == nil {
 		return EINVAL
@@ -732,7 +757,7 @@ func jfs_access(pid int, h uintptr, cpath *C.char, flags int) int {
 }
 
 //export jfs_create
-func jfs_create(pid int, h uintptr, cpath *C.char, mode uint16, umask uint16) int {
+func jfs_create(pid int, h int64, cpath *C.char, mode uint16, umask uint16) int {
 	w := F(h)
 	if w == nil {
 		return EINVAL
@@ -750,7 +775,7 @@ func jfs_create(pid int, h uintptr, cpath *C.char, mode uint16, umask uint16) in
 }
 
 //export jfs_mkdir
-func jfs_mkdir(pid int, h uintptr, cpath *C.char, mode uint16, umask uint16) int {
+func jfs_mkdir(pid int, h int64, cpath *C.char, mode uint16, umask uint16) int {
 	w := F(h)
 	if w == nil {
 		return EINVAL
@@ -764,7 +789,7 @@ func jfs_mkdir(pid int, h uintptr, cpath *C.char, mode uint16, umask uint16) int
 }
 
 //export jfs_delete
-func jfs_delete(pid int, h uintptr, cpath *C.char) int {
+func jfs_delete(pid int, h int64, cpath *C.char) int {
 	w := F(h)
 	if w == nil {
 		return EINVAL
@@ -773,7 +798,7 @@ func jfs_delete(pid int, h uintptr, cpath *C.char) int {
 }
 
 //export jfs_rmr
-func jfs_rmr(pid int, h uintptr, cpath *C.char) int {
+func jfs_rmr(pid int, h int64, cpath *C.char) int {
 	w := F(h)
 	if w == nil {
 		return EINVAL
@@ -782,7 +807,7 @@ func jfs_rmr(pid int, h uintptr, cpath *C.char) int {
 }
 
 //export jfs_rename
-func jfs_rename(pid int, h uintptr, oldpath *C.char, newpath *C.char) int {
+func jfs_rename(pid int, h int64, oldpath *C.char, newpath *C.char) int {
 	w := F(h)
 	if w == nil {
 		return EINVAL
@@ -791,7 +816,7 @@ func jfs_rename(pid int, h uintptr, oldpath *C.char, newpath *C.char) int {
 }
 
 //export jfs_truncate
-func jfs_truncate(pid int, h uintptr, path *C.char, length uint64) int {
+func jfs_truncate(pid int, h int64, path *C.char, length uint64) int {
 	w := F(h)
 	if w == nil {
 		return EINVAL
@@ -800,7 +825,7 @@ func jfs_truncate(pid int, h uintptr, path *C.char, length uint64) int {
 }
 
 //export jfs_setXattr
-func jfs_setXattr(pid int, h uintptr, path *C.char, name *C.char, value uintptr, vlen int, mode int) int {
+func jfs_setXattr(pid int, h int64, path *C.char, name *C.char, value uintptr, vlen int, mode int) int {
 	w := F(h)
 	if w == nil {
 		return EINVAL
@@ -816,7 +841,7 @@ func jfs_setXattr(pid int, h uintptr, path *C.char, name *C.char, value uintptr,
 }
 
 //export jfs_getXattr
-func jfs_getXattr(pid int, h uintptr, path *C.char, name *C.char, buf uintptr, bufsize int) int {
+func jfs_getXattr(pid int, h int64, path *C.char, name *C.char, buf uintptr, bufsize int) int {
 	w := F(h)
 	if w == nil {
 		return EINVAL
@@ -833,7 +858,7 @@ func jfs_getXattr(pid int, h uintptr, path *C.char, name *C.char, buf uintptr, b
 }
 
 //export jfs_listXattr
-func jfs_listXattr(pid int, h uintptr, path *C.char, buf uintptr, bufsize int) int {
+func jfs_listXattr(pid int, h int64, path *C.char, buf uintptr, bufsize int) int {
 	w := F(h)
 	if w == nil {
 		return EINVAL
@@ -850,7 +875,7 @@ func jfs_listXattr(pid int, h uintptr, path *C.char, buf uintptr, bufsize int) i
 }
 
 //export jfs_removeXattr
-func jfs_removeXattr(pid int, h uintptr, path *C.char, name *C.char) int {
+func jfs_removeXattr(pid int, h int64, path *C.char, name *C.char) int {
 	w := F(h)
 	if w == nil {
 		return EINVAL
@@ -858,17 +883,73 @@ func jfs_removeXattr(pid int, h uintptr, path *C.char, name *C.char) int {
 	return errno(w.RemoveXattr(w.withPid(pid), C.GoString(path), C.GoString(name)))
 }
 
-//export jfs_symlink
-func jfs_symlink(pid int, h uintptr, target *C.char, link *C.char) int {
+//export jfs_getfacl
+func jfs_getfacl(pid int, h int64, path *C.char, acltype int, buf uintptr, blen int) int {
 	w := F(h)
 	if w == nil {
 		return EINVAL
 	}
-	return errno(w.Symlink(w.withPid(pid), C.GoString(target), C.GoString(link)))
+	rule := acl.EmptyRule()
+	err := w.GetFacl(w.withPid(pid), C.GoString(path), uint8(acltype), rule)
+	if err != 0 {
+		return errno(err)
+	}
+	wb := utils.NewNativeBuffer(toBuf(buf, blen))
+	wb.Put16(rule.Owner)
+	wb.Put16(rule.Group)
+	wb.Put16(rule.Other)
+	wb.Put16(rule.Mask)
+	wb.Put16(uint16(len(rule.NamedUsers)))
+	wb.Put16(uint16(len(rule.NamedGroups)))
+	var off uintptr = 12
+	for i, entry := range append(rule.NamedUsers, rule.NamedGroups...) {
+		var name string
+		if i < len(rule.NamedUsers) {
+			name = w.uid2name(entry.Id)
+		} else {
+			name = w.gid2name(entry.Id)
+		}
+		if wb.Left() < len(name)+1+2 {
+			return -100
+		}
+		wb.Put([]byte(name))
+		wb.Put8(0)
+		wb.Put16(entry.Perm)
+	}
+	return int(off)
+}
+
+//export jfs_setfacl
+func jfs_setfacl(pid int, h int64, path *C.char, acltype int, buf uintptr, alen int) int {
+	w := F(h)
+	if w == nil {
+		return EINVAL
+	}
+	rule := acl.EmptyRule()
+	r := utils.NewNativeBuffer(toBuf(buf, alen))
+	rule.Owner = r.Get16()
+	rule.Group = r.Get16()
+	rule.Other = r.Get16()
+	rule.Mask = r.Get16()
+	namedusers := r.Get16()
+	namedgroups := r.Get16()
+	for i := uint16(0); i < namedusers+namedgroups; i++ {
+		name := string(r.Get(int(r.Get8())))
+		var entry acl.Entry
+		entry.Perm = uint16(r.Get8())
+		if i < namedusers {
+			entry.Id = w.lookupUid(name)
+			rule.NamedUsers = append(rule.NamedUsers, entry)
+		} else {
+			entry.Id = w.lookupGid(name)
+			rule.NamedGroups = append(rule.NamedGroups, entry)
+		}
+	}
+	return errno(w.SetFacl(w.withPid(pid), C.GoString(path), uint8(acltype), rule))
 }
 
 //export jfs_readlink
-func jfs_readlink(pid int, h uintptr, link *C.char, buf uintptr, bufsize int) int {
+func jfs_readlink(pid int, h int64, link *C.char, buf uintptr, bufsize int) int {
 	w := F(h)
 	if w == nil {
 		return EINVAL
@@ -902,7 +983,7 @@ func fill_stat(w *wrapper, wb *utils.Buffer, st *fs.FileStat) int {
 }
 
 //export jfs_stat1
-func jfs_stat1(pid int, h uintptr, cpath *C.char, buf uintptr) int {
+func jfs_stat1(pid int, h int64, cpath *C.char, buf uintptr) int {
 	w := F(h)
 	if w == nil {
 		return EINVAL
@@ -915,7 +996,7 @@ func jfs_stat1(pid int, h uintptr, cpath *C.char, buf uintptr) int {
 }
 
 //export jfs_lstat1
-func jfs_lstat1(pid int, h uintptr, cpath *C.char, buf uintptr) int {
+func jfs_lstat1(pid int, h int64, cpath *C.char, buf uintptr) int {
 	w := F(h)
 	if w == nil {
 		return EINVAL
@@ -928,7 +1009,7 @@ func jfs_lstat1(pid int, h uintptr, cpath *C.char, buf uintptr) int {
 }
 
 //export jfs_summary
-func jfs_summary(pid int, h uintptr, cpath *C.char, buf uintptr) int {
+func jfs_summary(pid int, h int64, cpath *C.char, buf uintptr) int {
 	w := F(h)
 	if w == nil {
 		return EINVAL
@@ -951,7 +1032,7 @@ func jfs_summary(pid int, h uintptr, cpath *C.char, buf uintptr) int {
 }
 
 //export jfs_statvfs
-func jfs_statvfs(pid int, h uintptr, buf uintptr) int {
+func jfs_statvfs(pid int, h int64, buf uintptr) int {
 	w := F(h)
 	if w == nil {
 		return EINVAL
@@ -964,7 +1045,7 @@ func jfs_statvfs(pid int, h uintptr, buf uintptr) int {
 }
 
 //export jfs_chmod
-func jfs_chmod(pid int, h uintptr, cpath *C.char, mode C.mode_t) int {
+func jfs_chmod(pid int, h int64, cpath *C.char, mode C.mode_t) int {
 	w := F(h)
 	if w == nil {
 		return EINVAL
@@ -978,7 +1059,7 @@ func jfs_chmod(pid int, h uintptr, cpath *C.char, mode C.mode_t) int {
 }
 
 //export jfs_utime
-func jfs_utime(pid int, h uintptr, cpath *C.char, mtime, atime int64) int {
+func jfs_utime(pid int, h int64, cpath *C.char, mtime, atime int64) int {
 	w := F(h)
 	if w == nil {
 		return EINVAL
@@ -992,7 +1073,7 @@ func jfs_utime(pid int, h uintptr, cpath *C.char, mtime, atime int64) int {
 }
 
 //export jfs_setOwner
-func jfs_setOwner(pid int, h uintptr, cpath *C.char, owner *C.char, group *C.char) int {
+func jfs_setOwner(pid int, h int64, cpath *C.char, owner *C.char, group *C.char) int {
 	w := F(h)
 	if w == nil {
 		return EINVAL
@@ -1019,7 +1100,7 @@ func setOwner(w *wrapper, ctx meta.Context, path string, owner, group string) in
 }
 
 //export jfs_listdir
-func jfs_listdir(pid int, h uintptr, cpath *C.char, offset int, buf uintptr, bufsize int) int {
+func jfs_listdir(pid int, h int64, cpath *C.char, offset int, buf uintptr, bufsize int) int {
 	var ctx meta.Context
 	var f *fs.File
 	var w *wrapper
@@ -1077,7 +1158,7 @@ func toBuf(s uintptr, sz int) []byte {
 }
 
 //export jfs_concat
-func jfs_concat(pid int, h uintptr, _dst *C.char, buf uintptr, bufsize int) int {
+func jfs_concat(pid int, h int64, _dst *C.char, buf uintptr, bufsize int) int {
 	w := F(h)
 	if w == nil {
 		return EINVAL

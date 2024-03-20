@@ -20,6 +20,7 @@ import (
 	"os"
 	"strings"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/urfave/cli/v2"
 )
 
@@ -34,12 +35,14 @@ type Config struct {
 	Dry            bool
 	DeleteSrc      bool
 	DeleteDst      bool
+	MatchFullPath  bool
 	Dirs           bool
 	Exclude        []string
 	Include        []string
 	Existing       bool
 	IgnoreExisting bool
 	Links          bool
+	Inplace        bool
 	Limit          int64
 	Manager        string
 	Workers        []string
@@ -56,6 +59,7 @@ type Config struct {
 
 	rules          []rule
 	concurrentList chan int
+	Registerer     prometheus.Registerer
 }
 
 func envList() []string {
@@ -144,9 +148,11 @@ func NewConfigFromCli(c *cli.Context) *Config {
 		DeleteDst:      c.Bool("delete-dst"),
 		Exclude:        c.StringSlice("exclude"),
 		Include:        c.StringSlice("include"),
+		MatchFullPath:  c.Bool("match-full-path"),
 		Existing:       c.Bool("existing"),
 		IgnoreExisting: c.Bool("ignore-existing"),
 		Links:          c.Bool("links"),
+		Inplace:        c.Bool("inplace"),
 		Limit:          c.Int64("limit"),
 		Workers:        c.StringSlice("worker"),
 		ManagerAddr:    c.String("manager-addr"),
