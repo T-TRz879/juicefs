@@ -45,6 +45,17 @@ func (u *ufile) String() string {
 	return fmt.Sprintf("ufile://%s/", uri.Host)
 }
 
+func (u *ufile) Limits() Limits {
+	// only support 4MB part size and max object size: 5TB
+	return Limits{
+		IsSupportMultipartUpload: true,
+		IsSupportUploadPartCopy:  false,
+		MinPartSize:              4 << 20,
+		MaxPartSize:              4 << 20,
+		MaxPartCount:             1310720,
+	}
+}
+
 func ufileSigner(req *http.Request, accessKey, secretKey, signName string) {
 	if accessKey == "" {
 		return
@@ -191,7 +202,7 @@ type DataItem struct {
 	ModifyTime int
 }
 
-// ListObjectsOutput presents output for ListObjects.
+// uFileListObjectsOutput presents output for ListObjects.
 type uFileListObjectsOutput struct {
 	// Object keys
 	DataSet []*DataItem `json:"DataSet,omitempty"`

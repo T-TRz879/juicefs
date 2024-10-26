@@ -95,7 +95,7 @@ func (f *jFile) Close() error {
 	return toError(f.f.Close(ctx))
 }
 
-func (j *juiceFS) Get(key string, off, limit int64) (io.ReadCloser, error) {
+func (j *juiceFS) Get(key string, off, limit int64, getters ...object.AttrGetter) (io.ReadCloser, error) {
 	f, err := j.jfs.Open(ctx, j.path(key), vfs.MODE_MASK_R)
 	if err != 0 {
 		return nil, err
@@ -116,7 +116,7 @@ var bufPool = sync.Pool{
 	},
 }
 
-func (j *juiceFS) Put(key string, in io.Reader) (err error) {
+func (j *juiceFS) Put(key string, in io.Reader, getters ...object.AttrGetter) (err error) {
 	p := j.path(key)
 	if strings.HasSuffix(p, "/") {
 		eno := j.jfs.MkdirAll(ctx, p, 0777, j.umask)
@@ -171,7 +171,7 @@ func (j *juiceFS) Put(key string, in io.Reader) (err error) {
 	return nil
 }
 
-func (j *juiceFS) Delete(key string) error {
+func (j *juiceFS) Delete(key string, getters ...object.AttrGetter) error {
 	if key == "" {
 		return nil
 	}
@@ -371,6 +371,10 @@ func getDefaultChunkConf(format *meta.Format) *chunk.Config {
 	}
 	chunkConf.SelfCheck(format.UUID)
 	return chunkConf
+}
+
+func (j *juiceFS) Shutdown() {
+	_ = j.jfs.Meta().CloseSession()
 }
 
 func newJFS(endpoint, accessKey, secretKey, token string) (object.ObjectStorage, error) {

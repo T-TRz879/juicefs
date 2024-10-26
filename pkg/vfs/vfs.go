@@ -19,6 +19,7 @@ package vfs
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"runtime"
 	"sort"
@@ -58,7 +59,6 @@ type FuseOptions struct {
 	MaxBackground            int
 	MaxWrite                 int
 	MaxReadAhead             int
-	MaxPages                 int
 	IgnoreSecurityLabels     bool // ignoring labels should be provided as a fusermount mount option.
 	RememberInodes           bool
 	FsName                   string
@@ -66,13 +66,18 @@ type FuseOptions struct {
 	SingleThreaded           bool
 	DisableXAttrs            bool
 	Debug                    bool
+	Logger                   *log.Logger `json:"-"`
 	EnableLocks              bool
+	EnableSymlinkCaching     bool `json:",omitempty"`
 	ExplicitDataCacheControl bool
+	SyncRead                 bool `json:",omitempty"`
 	DirectMount              bool
+	DirectMountStrict        bool `json:",omitempty"`
 	DirectMountFlags         uintptr
 	EnableAcl                bool
+	DisableReadDirPlus       bool `json:",omitempty"`
 	EnableWriteback          bool
-	EnableIoctl              bool
+	EnableIoctl              bool `json:",omitempty"`
 	DontUmask                bool
 	OtherCaps                uint32
 	NoAllocForRead           bool
@@ -101,7 +106,6 @@ func (o FuseOptions) StripOptions() FuseOptions {
 	// ignore there options because they cannot be configured by users
 	o.Name = ""
 	o.MaxBackground = 0
-	o.MaxWrite = 0
 	o.MaxReadAhead = 0
 	o.DirectMount = false
 	o.DontUmask = false
@@ -126,12 +130,11 @@ type Config struct {
 	RootSquash           *RootSquash `json:",omitempty"`
 	NonDefaultPermission bool        `json:",omitempty"`
 
-	Pid        int
-	PPid       int
-	DebugAgent string
-	CommPath   string       `json:",omitempty"`
-	StatePath  string       `json:",omitempty"`
-	FuseOpts   *FuseOptions `json:",omitempty"`
+	Pid       int
+	PPid      int
+	CommPath  string       `json:",omitempty"`
+	StatePath string       `json:",omitempty"`
+	FuseOpts  *FuseOptions `json:",omitempty"`
 }
 
 type RootSquash struct {
@@ -169,7 +172,7 @@ func (v *VFS) Lookup(ctx Context, parent Ino, name string) (entry *meta.Entry, e
 		}
 	}
 	defer func() {
-		logit(ctx, "lookup (%d,%s): %s%s", parent, name, strerr(err), (*Entry)(entry))
+		logit(ctx, "lookup", err, "(%d,%s):%s", parent, name, (*Entry)(entry))
 	}()
 	if len(name) > maxName {
 		err = syscall.ENAMETOOLONG
@@ -188,7 +191,7 @@ func (v *VFS) GetAttr(ctx Context, ino Ino, opened uint8) (entry *meta.Entry, er
 		entry = &meta.Entry{Inode: n.inode, Attr: n.attr}
 		return
 	}
-	defer func() { logit(ctx, "getattr (%d): %s%s", ino, strerr(err), (*Entry)(entry)) }()
+	defer func() { logit(ctx, "getattr", err, "(%d):%s", ino, (*Entry)(entry)) }()
 	var attr = &Attr{}
 	err = v.Meta.GetAttr(ctx, ino, attr)
 	if err == 0 {
@@ -219,7 +222,7 @@ func get_filetype(mode uint16) uint8 {
 
 func (v *VFS) Mknod(ctx Context, parent Ino, name string, mode uint16, cumask uint16, rdev uint32) (entry *meta.Entry, err syscall.Errno) {
 	defer func() {
-		logit(ctx, "mknod (%d,%s,%s:0%04o,0x%08X): %s%s", parent, name, smode(mode), mode, rdev, strerr(err), (*Entry)(entry))
+		logit(ctx, "mknod", err, "(%d,%s,%s:0%04o,0x%08X):%s", parent, name, smode(mode), mode, rdev, (*Entry)(entry))
 	}()
 	if parent == rootID && IsSpecialName(name) {
 		err = syscall.EEXIST
@@ -246,7 +249,7 @@ func (v *VFS) Mknod(ctx Context, parent Ino, name string, mode uint16, cumask ui
 }
 
 func (v *VFS) Unlink(ctx Context, parent Ino, name string) (err syscall.Errno) {
-	defer func() { logit(ctx, "unlink (%d,%s): %s", parent, name, strerr(err)) }()
+	defer func() { logit(ctx, "unlink", err, "(%d,%s)", parent, name) }()
 	if parent == rootID && IsSpecialName(name) {
 		err = syscall.EPERM
 		return
@@ -264,7 +267,7 @@ func (v *VFS) Unlink(ctx Context, parent Ino, name string) (err syscall.Errno) {
 
 func (v *VFS) Mkdir(ctx Context, parent Ino, name string, mode uint16, cumask uint16) (entry *meta.Entry, err syscall.Errno) {
 	defer func() {
-		logit(ctx, "mkdir (%d,%s,%s:0%04o): %s%s", parent, name, smode(mode), mode, strerr(err), (*Entry)(entry))
+		logit(ctx, "mkdir", err, "(%d,%s,%s:0%04o):%s", parent, name, smode(mode), mode, (*Entry)(entry))
 	}()
 	if parent == rootID && IsSpecialName(name) {
 		err = syscall.EEXIST
@@ -286,7 +289,7 @@ func (v *VFS) Mkdir(ctx Context, parent Ino, name string, mode uint16, cumask ui
 }
 
 func (v *VFS) Rmdir(ctx Context, parent Ino, name string) (err syscall.Errno) {
-	defer func() { logit(ctx, "rmdir (%d,%s): %s", parent, name, strerr(err)) }()
+	defer func() { logit(ctx, "rmdir", err, "(%d,%s)", parent, name) }()
 	if len(name) > maxName {
 		err = syscall.ENAMETOOLONG
 		return
@@ -300,7 +303,7 @@ func (v *VFS) Rmdir(ctx Context, parent Ino, name string) (err syscall.Errno) {
 
 func (v *VFS) Symlink(ctx Context, path string, parent Ino, name string) (entry *meta.Entry, err syscall.Errno) {
 	defer func() {
-		logit(ctx, "symlink (%d,%s,%s): %s%s", parent, name, path, strerr(err), (*Entry)(entry))
+		logit(ctx, "symlink", err, "(%d,%s,%s):%s", parent, name, path, (*Entry)(entry))
 	}()
 	if parent == rootID && IsSpecialName(name) {
 		err = syscall.EEXIST
@@ -322,14 +325,14 @@ func (v *VFS) Symlink(ctx Context, path string, parent Ino, name string) (entry 
 }
 
 func (v *VFS) Readlink(ctx Context, ino Ino) (path []byte, err syscall.Errno) {
-	defer func() { logit(ctx, "readlink (%d): %s (%s)", ino, strerr(err), string(path)) }()
+	defer func() { logit(ctx, "readlink", err, "(%d): (%s)", ino, string(path)) }()
 	err = v.Meta.ReadLink(ctx, ino, &path)
 	return
 }
 
 func (v *VFS) Rename(ctx Context, parent Ino, name string, newparent Ino, newname string, flags uint32) (err syscall.Errno) {
 	defer func() {
-		logit(ctx, "rename (%d,%s,%d,%s,%d): %s", parent, name, newparent, newname, flags, strerr(err))
+		logit(ctx, "rename", err, "(%d,%s,%d,%s,%d)", parent, name, newparent, newname, flags)
 	}()
 	if parent == rootID && IsSpecialName(name) {
 		err = syscall.EPERM
@@ -357,7 +360,7 @@ func (v *VFS) Rename(ctx Context, parent Ino, name string, newparent Ino, newnam
 
 func (v *VFS) Link(ctx Context, ino Ino, newparent Ino, newname string) (entry *meta.Entry, err syscall.Errno) {
 	defer func() {
-		logit(ctx, "link (%d,%d,%s): %s%s", ino, newparent, newname, strerr(err), (*Entry)(entry))
+		logit(ctx, "link", err, "(%d,%d,%s):%s", ino, newparent, newname, (*Entry)(entry))
 	}()
 	if IsSpecialNode(ino) {
 		err = syscall.EPERM
@@ -382,7 +385,7 @@ func (v *VFS) Link(ctx Context, ino Ino, newparent Ino, newname string) (entry *
 }
 
 func (v *VFS) Opendir(ctx Context, ino Ino, flags uint32) (fh uint64, err syscall.Errno) {
-	defer func() { logit(ctx, "opendir (%d): %s [fh:%d]", ino, strerr(err), fh) }()
+	defer func() { logit(ctx, "opendir", err, "(%d) [fh:%d]", ino, fh) }()
 	if ctx.CheckPermission() {
 		var mmask uint8 = 0
 		switch flags & (syscall.O_RDONLY | syscall.O_WRONLY | syscall.O_RDWR) {
@@ -412,7 +415,7 @@ func (v *VFS) UpdateLength(inode Ino, attr *meta.Attr) {
 }
 
 func (v *VFS) Readdir(ctx Context, ino Ino, size uint32, off int, fh uint64, plus bool) (entries []*meta.Entry, readAt time.Time, err syscall.Errno) {
-	defer func() { logit(ctx, "readdir (%d,%d,%d): %s (%d)", ino, size, off, strerr(err), len(entries)) }()
+	defer func() { logit(ctx, "readdir", err, "(%d,%d,%d): (%d)", ino, size, off, len(entries)) }()
 	h := v.findHandle(ino, fh)
 	if h == nil {
 		err = syscall.EBADF
@@ -421,39 +424,31 @@ func (v *VFS) Readdir(ctx Context, ino Ino, size uint32, off int, fh uint64, plu
 	h.Lock()
 	defer h.Unlock()
 
-	if h.children == nil || off == 0 {
-		var inodes []*meta.Entry
-		h.readAt = time.Now()
-		err = v.Meta.Readdir(ctx, ino, 1, &inodes)
-		if err == syscall.EACCES {
-			err = v.Meta.Readdir(ctx, ino, 0, &inodes)
+	if h.dirHandler == nil || off == 0 {
+		if h.dirHandler != nil {
+			h.dirHandler.Close()
+			h.dirHandler = nil
 		}
-		if err != 0 {
-			return
-		}
-		h.children = inodes
+		var initEntries []*meta.Entry
 		if ino == rootID && !v.Conf.HideInternal {
-			// add internal nodes
 			for _, node := range internalNodes[1:] {
-				h.children = append(h.children, &meta.Entry{
+				initEntries = append(initEntries, &meta.Entry{
 					Inode: node.inode,
 					Name:  []byte(node.name),
 					Attr:  node.attr,
 				})
 			}
 		}
-		index := make(map[string]int)
-		for i, e := range inodes {
-			index[string(e.Name)] = i
+		h.readAt = time.Now()
+		if h.dirHandler, err = v.Meta.NewDirHandler(ctx, ino, plus, initEntries); err != 0 {
+			return
 		}
-		h.index = index
 	}
-	if off < len(h.children) {
-		entries = h.children[off:]
-		// we don't know how much of them will be sent, assume all of them
-		h.readOff = len(h.children) - 1
+	if entries, err = h.dirHandler.List(ctx, off); err != 0 {
+		return
 	}
 	readAt = h.readAt
+	logger.Debugf("readdir: [%d:%d] %d entries, offset=%d", ino, fh, len(entries), off)
 	return
 }
 
@@ -464,22 +459,24 @@ func (v *VFS) UpdateReaddirOffset(ctx Context, ino Ino, fh uint64, off int) {
 	}
 	h.Lock()
 	defer h.Unlock()
-	h.readOff = off
+	if h.dirHandler != nil {
+		h.dirHandler.Read(off)
+	}
 }
 
 func (v *VFS) Releasedir(ctx Context, ino Ino, fh uint64) int {
+	defer logit(ctx, "releasedir", 0, "(%d)", ino)
 	h := v.findHandle(ino, fh)
 	if h == nil {
 		return 0
 	}
 	v.ReleaseHandler(ino, fh)
-	logit(ctx, "releasedir (%d): OK", ino)
 	return 0
 }
 
 func (v *VFS) Create(ctx Context, parent Ino, name string, mode uint16, cumask uint16, flags uint32) (entry *meta.Entry, fh uint64, err syscall.Errno) {
 	defer func() {
-		logit(ctx, "create (%d,%s,%s:0%04o): %s%s [fh:%d]", parent, name, smode(mode), mode, strerr(err), (*Entry)(entry), fh)
+		logit(ctx, "create", err, "(%d,%s,%s:0%04o):%s [fh:%d]", parent, name, smode(mode), mode, (*Entry)(entry), fh)
 	}()
 	if parent == rootID && IsSpecialName(name) {
 		err = syscall.EEXIST
@@ -508,9 +505,9 @@ func (v *VFS) Create(ctx Context, parent Ino, name string, mode uint16, cumask u
 func (v *VFS) Open(ctx Context, ino Ino, flags uint32) (entry *meta.Entry, fh uint64, err syscall.Errno) {
 	defer func() {
 		if entry != nil {
-			logit(ctx, "open (%d): %s [fh:%d]", ino, strerr(err), fh)
+			logit(ctx, "open", err, "(%d,%#x) [fh:%d]", ino, flags, fh)
 		} else {
-			logit(ctx, "open (%d): %s", ino, strerr(err))
+			logit(ctx, "open", err, "(%d,%#x)", ino, flags)
 		}
 	}()
 	var attr = &Attr{}
@@ -604,7 +601,7 @@ func (v *VFS) ReleaseHandler(ino Ino, fh uint64) {
 
 func (v *VFS) Release(ctx Context, ino Ino, fh uint64) {
 	var err syscall.Errno
-	defer func() { logit(ctx, "release (%d,%d): %s", ino, fh, strerr(err)) }()
+	defer func() { logit(ctx, "release", err, "(%d,%d)", ino, fh) }()
 	if IsSpecialNode(ino) {
 		if ino == logInode {
 			closeAccessLog(fh)
@@ -633,7 +630,7 @@ func (v *VFS) Release(ctx Context, ino Ino, fh uint64) {
 				v.invalidateAttr(ino)
 			}
 			if locks&1 != 0 {
-				_ = v.Meta.Flock(ctx, ino, fowner, F_UNLCK, false)
+				_ = v.Meta.Flock(ctx, ino, fowner^fh, F_UNLCK, false)
 			}
 			if locks&2 != 0 && powner != 0 {
 				_ = v.Meta.Setlk(ctx, ino, powner, false, F_UNLCK, 0, 0x7FFFFFFFFFFFFFFF, 0)
@@ -659,22 +656,27 @@ func (v *VFS) Read(ctx Context, ino Ino, buf []byte, off uint64, fh uint64) (n i
 			err = syscall.EBADF
 			return
 		}
-		switch ino {
-		case statsInode:
-			h.data = collectMetrics(v.registry)
-		case configInode:
-			v.Conf.Format = v.Meta.GetFormat()
-			if v.UpdateFormat != nil {
-				v.UpdateFormat(&v.Conf.Format)
+		if len(h.data) == 0 {
+			switch ino {
+			case statsInode:
+				h.data = collectMetrics(v.registry)
+			case configInode:
+				v.Conf.Format = v.Meta.GetFormat()
+				if v.UpdateFormat != nil {
+					v.UpdateFormat(&v.Conf.Format)
+				}
+				v.Conf.Format.RemoveSecret()
+				h.data, _ = json.MarshalIndent(v.Conf, "", " ")
 			}
-			v.Conf.Format.RemoveSecret()
-			h.data, _ = json.MarshalIndent(v.Conf, "", " ")
 		}
 
 		if ino == logInode {
+			if h.flags&O_RECOVERED != 0 {
+				openAccessLog(fh)
+			}
 			n = readAccessLog(fh, buf)
 		} else {
-			defer func() { logit(ctx, "read (%d,%d,%d,%d): %s (%d)", ino, size, off, fh, strerr(err), n) }()
+			defer func() { logit(ctx, "read", err, "(%d,%d,%d,%d): %d", ino, size, off, fh, n) }()
 			h.Lock()
 			defer h.Unlock()
 			if off < h.off {
@@ -696,7 +698,7 @@ func (v *VFS) Read(ctx Context, ino Ino, buf []byte, off uint64, fh uint64) (n i
 
 	defer func() {
 		readSizeHistogram.Observe(float64(n))
-		logit(ctx, "read (%d,%d,%d): %s (%d)", ino, size, off, strerr(err), n)
+		logit(ctx, "read", err, "(%d,%d,%d,%d): (%d)", ino, size, off, fh, n)
 	}()
 	h := v.findHandle(ino, fh)
 	if h == nil {
@@ -729,7 +731,7 @@ func (v *VFS) Read(ctx Context, ino Ino, buf []byte, off uint64, fh uint64) (n i
 	}
 
 	// there could be read operation for write-only if kernel writeback is enabled
-	if !v.Conf.FuseOpts.EnableWriteback && !hasReadPerm(h.flags) {
+	if v.Conf.FuseOpts != nil && !v.Conf.FuseOpts.EnableWriteback && !hasReadPerm(h.flags) {
 		err = syscall.EBADF
 		return
 	}
@@ -756,7 +758,7 @@ func (v *VFS) Write(ctx Context, ino Ino, buf []byte, off, fh uint64) (err sysca
 	if ino == controlInode && runtime.GOOS == "darwin" {
 		fh = v.getControlHandle(ctx.Pid())
 	}
-	defer func() { logit(ctx, "write (%d,%d,%d,%d): %s", ino, size, off, fh, strerr(err)) }()
+	defer func() { logit(ctx, "write", err, "(%d,%d,%d,%d)", ino, size, off, fh) }()
 	h := v.findHandle(ino, fh)
 	if h == nil {
 		err = syscall.EBADF
@@ -816,7 +818,7 @@ func (v *VFS) Write(ctx Context, ino Ino, buf []byte, off, fh uint64) (err sysca
 }
 
 func (v *VFS) Fallocate(ctx Context, ino Ino, mode uint8, off, size int64, fh uint64) (err syscall.Errno) {
-	defer func() { logit(ctx, "fallocate (%d,%d,%d,%d): %s", ino, mode, off, size, strerr(err)) }()
+	defer func() { logit(ctx, "fallocate", err, "(%d,%d,%d,%d)", ino, mode, off, size) }()
 	if off < 0 || size <= 0 {
 		err = syscall.EINVAL
 		return
@@ -867,7 +869,7 @@ func (v *VFS) Fallocate(ctx Context, ino Ino, mode uint8, off, size int64, fh ui
 
 func (v *VFS) CopyFileRange(ctx Context, nodeIn Ino, fhIn, offIn uint64, nodeOut Ino, fhOut, offOut, size uint64, flags uint32) (copied uint64, err syscall.Errno) {
 	defer func() {
-		logit(ctx, "copy_file_range (%d,%d,%d,%d,%d,%d): %s", nodeIn, offIn, nodeOut, offOut, size, flags, strerr(err))
+		logit(ctx, "copy_file_range", err, "(%d,%d,%d,%d,%d,%d)", nodeIn, offIn, nodeOut, offOut, size, flags)
 	}()
 	if IsSpecialNode(nodeIn) {
 		err = syscall.ENOTSUP
@@ -946,7 +948,7 @@ func (v *VFS) Flush(ctx Context, ino Ino, fh uint64, lockOwner uint64) (err sysc
 		fh = v.getControlHandle(ctx.Pid())
 		defer v.releaseControlHandle(ctx.Pid())
 	}
-	defer func() { logit(ctx, "flush (%d,%d,%016X): %s", ino, fh, lockOwner, strerr(err)) }()
+	defer func() { logit(ctx, "flush", err, "(%d,%d,%016X)", ino, fh, lockOwner) }()
 	h := v.findHandle(ino, fh)
 	if h == nil {
 		err = syscall.EBADF
@@ -987,7 +989,7 @@ func (v *VFS) Flush(ctx Context, ino Ino, fh uint64, lockOwner uint64) (err sysc
 }
 
 func (v *VFS) Fsync(ctx Context, ino Ino, datasync int, fh uint64) (err syscall.Errno) {
-	defer func() { logit(ctx, "fsync (%d,%d): %s", ino, datasync, strerr(err)) }()
+	defer func() { logit(ctx, "fsync", err, "(%d,%d)", ino, datasync) }()
 	if IsSpecialNode(ino) {
 		return
 	}
@@ -1017,7 +1019,7 @@ const (
 )
 
 func (v *VFS) SetXattr(ctx Context, ino Ino, name string, value []byte, flags uint32) (err syscall.Errno) {
-	defer func() { logit(ctx, "setxattr (%d,%s,%d,%d): %s", ino, name, len(value), flags, strerr(err)) }()
+	defer func() { logit(ctx, "setxattr", err, "(%d,%s,%d,%d)", ino, name, len(value), flags) }()
 	if IsSpecialNode(ino) {
 		err = syscall.EPERM
 		return
@@ -1056,14 +1058,19 @@ func (v *VFS) SetXattr(ctx Context, ino Ino, name string, value []byte, flags ui
 			return
 		}
 		err = v.Meta.SetFacl(ctx, ino, aclType, rule)
+		v.invalidateAttr(ino)
 	} else {
+		// ignore NoSecurity flag
+		if runtime.GOOS == "darwin" && (flags&meta.XattrNoSecurity) != 0 {
+			flags &= ^uint32(meta.XattrNoSecurity)
+		}
 		err = v.Meta.SetXattr(ctx, ino, name, value, flags)
 	}
 	return
 }
 
 func (v *VFS) GetXattr(ctx Context, ino Ino, name string, size uint32) (value []byte, err syscall.Errno) {
-	defer func() { logit(ctx, "getxattr (%d,%s,%d): %s (%d)", ino, name, size, strerr(err), len(value)) }()
+	defer func() { logit(ctx, "getxattr", err, "(%d,%s,%d): (%d)", ino, name, size, len(value)) }()
 	if IsSpecialNode(ino) {
 		err = meta.ENOATTR
 		return
@@ -1103,7 +1110,7 @@ func (v *VFS) GetXattr(ctx Context, ino Ino, name string, size uint32) (value []
 }
 
 func (v *VFS) ListXattr(ctx Context, ino Ino, size int) (data []byte, err syscall.Errno) {
-	defer func() { logit(ctx, "listxattr (%d,%d): %s (%d)", ino, size, strerr(err), len(data)) }()
+	defer func() { logit(ctx, "listxattr", err, "(%d,%d): (%d)", ino, size, len(data)) }()
 	if IsSpecialNode(ino) {
 		err = meta.ENOATTR
 		return
@@ -1116,7 +1123,7 @@ func (v *VFS) ListXattr(ctx Context, ino Ino, size int) (data []byte, err syscal
 }
 
 func (v *VFS) RemoveXattr(ctx Context, ino Ino, name string) (err syscall.Errno) {
-	defer func() { logit(ctx, "removexattr (%d,%s): %s", ino, name, strerr(err)) }()
+	defer func() { logit(ctx, "removexattr", err, "(%d,%s)", ino, name) }()
 	if IsSpecialNode(ino) {
 		err = syscall.EPERM
 		return
@@ -1209,10 +1216,10 @@ func NewVFS(conf *Config, m meta.Meta, store chunk.ChunkStore, registerer promet
 	if statePath == "" {
 		statePath = fmt.Sprintf("/tmp/state%d.json", os.Getppid())
 	}
-
 	if err := v.loadAllHandles(statePath); err != nil && !os.IsNotExist(err) {
 		logger.Errorf("load state from %s: %s", statePath, err)
 	}
+	_ = os.Rename(statePath, statePath+".bak")
 
 	go v.cleanupModified()
 	initVFSMetrics(v, writer, reader, registerer)
@@ -1255,7 +1262,7 @@ func (v *VFS) cleanupModified() {
 func (v *VFS) FlushAll(path string) (err error) {
 	now := time.Now()
 	defer func() {
-		logger.Infof("flush buffered data in %s: %s", time.Since(now), err)
+		logger.Infof("flush buffered data in %s: %v", time.Since(now), err)
 	}()
 	err = v.writer.FlushAll()
 	if err != nil {
@@ -1319,6 +1326,9 @@ func InitMetrics(registerer prometheus.Registerer) {
 	registerer.MustRegister(readSizeHistogram)
 	registerer.MustRegister(writtenSizeHistogram)
 	registerer.MustRegister(opsDurationsHistogram)
+	registerer.MustRegister(opsTotal)
+	registerer.MustRegister(opsDurations)
+	registerer.MustRegister(opsIOErrors)
 	registerer.MustRegister(compactSizeHistogram)
 }
 

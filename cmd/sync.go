@@ -123,6 +123,22 @@ func selectionFlags() []cli.Flag {
 			Name:  "match-full-path",
 			Usage: "match filters again the full path",
 		},
+		&cli.StringFlag{
+			Name:  "max-size",
+			Usage: "skip files larger than `SIZE`",
+		},
+		&cli.StringFlag{
+			Name:  "min-size",
+			Usage: "skip files smaller than `SIZE`",
+		},
+		&cli.StringFlag{
+			Name:  "max-age",
+			Usage: "skip files older than `DURATION`",
+		},
+		&cli.StringFlag{
+			Name:  "min-age",
+			Usage: "skip files newer than `DURATION`",
+		},
 		&cli.Int64Flag{
 			Name:  "limit",
 			Usage: "limit the number of objects that will be processed (-1 is unlimited, 0 is to process nothing)",
@@ -187,6 +203,11 @@ func syncActionFlags() []cli.Flag {
 			Name:  "check-new",
 			Usage: "verify integrity of newly copied files",
 		},
+		&cli.Int64Flag{
+			Name:  "max-failure",
+			Value: -1,
+			Usage: "max number of allowed failed files (-1 for unlimited)",
+		},
 		&cli.BoolFlag{
 			Name:  "dry",
 			Usage: "don't copy file",
@@ -220,7 +241,7 @@ func syncStorageFlags() []cli.Flag {
 			Name:  "storage-class",
 			Usage: "the storage class for destination",
 		},
-		&cli.IntFlag{
+		&cli.StringFlag{
 			Name:  "bwlimit",
 			Usage: "limit bandwidth in Mbps (0 means unlimited)",
 		},
@@ -357,6 +378,16 @@ func createSyncStorage(uri string, conf *sync.Config) (object.ObjectStorage, err
 	}
 
 	store, err := object.CreateStorage(name, endpoint, accessKey, secretKey, token)
+	if name == "nfs" && err != nil {
+		p := u.Path
+		for err != nil && strings.Contains(err.Error(), "MNT3ERR_NOENT") {
+			p = filepath.Dir(p)
+			store, err = object.CreateStorage(name, u.Host+p, accessKey, secretKey, token)
+		}
+		if err == nil {
+			store = object.WithPrefix(store, u.Path[len(p):])
+		}
+	}
 	if err != nil {
 		return nil, fmt.Errorf("create %s %s: %s", name, endpoint, err)
 	}
@@ -435,9 +466,16 @@ func doSync(c *cli.Context) error {
 	if err != nil {
 		return err
 	}
+	defer func() {
+		object.Shutdown(src)
+		object.Shutdown(dst)
+	}()
 	if config.StorageClass != "" {
 		if os, ok := dst.(object.SupportStorageClass); ok {
-			os.SetStorageClass(config.StorageClass)
+			err := os.SetStorageClass(config.StorageClass)
+			if err != nil {
+				logger.Errorf("set storage class %s: %s", config.StorageClass, err)
+			}
 		}
 	}
 

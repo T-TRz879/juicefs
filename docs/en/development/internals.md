@@ -81,6 +81,7 @@ type Format struct {
     MetaVersion      int    `json:",omitempty"`
     MinClientVersion string `json:",omitempty"`
     MaxClientVersion string `json:",omitempty"`
+    EnableACL        bool
 }
 ```
 
@@ -103,6 +104,7 @@ type Format struct {
 - MetaVersion: the version of the metadata structure, currently V1 (V0 and V1 are the same)
 - MinClientVersion: the minimum client version allowed to connect, clients earlier than this version will be denied
 - MaxClientVersion: the maximum client version allowed to connect
+- EnableACL: enable ACL or not
 
 This structure is serialized into JSON format and stored in the metadata engine.
 
@@ -168,12 +170,15 @@ type Attr struct {
     Parent    Ino  // inode of parent; 0 means tracked by parentKey (for hardlinks)
     Full      bool // the attributes are completed or not
     KeepCache bool // whether to keep the cached page or not
+
+    AccessACL  uint32 // access ACL id (identical ACL rules share the same access ACL ID.)
+    DefaultACL uint32 // default ACL id (default ACL and the access ACL share the same cache and store)
 }
 ```
 
 There are a few fields that need clarification.
 
-- Atime/Atimensec: See [`--atime-mode`](../reference/command_reference.md#mount)
+- Atime/Atimensec: See [`--atime-mode`](../reference/command_reference.mdx#mount-metadata-options)
 - Nlink
   - Directory file: initial value is 2 ('.' and '..'), add 1 for each subdirectory
   - Other files: initial value is 1, add 1 for each hard link created
@@ -503,6 +508,8 @@ type node struct {
     Length uint64 `xorm:"notnull"`
     Rdev   uint32
     Parent Ino
+    AccessACLId  uint32 `xorm:"'access_acl_id'"`
+    DefaultACLId uint32 `xorm:"'default_acl_id'"`
 }
 ```
 
@@ -723,7 +730,7 @@ type flock struct {
 }
 ```
 
-#### Plock {tkv-plock}
+#### Plock {#tkv-plock}
 
 ```
 P${inode} -> plocks

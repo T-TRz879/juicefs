@@ -63,6 +63,8 @@ import java.util.jar.JarFile;
 import java.util.stream.Collectors;
 import java.util.zip.GZIPInputStream;
 import java.util.zip.ZipEntry;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /****************************************************************
  * Implement the FileSystem API for JuiceFS
@@ -72,6 +74,18 @@ import java.util.zip.ZipEntry;
 public class JuiceFileSystemImpl extends FileSystem {
 
   public static final Logger LOG = LoggerFactory.getLogger(JuiceFileSystemImpl.class);
+  public static final String gitVer = loadVersion();
+
+  static String loadVersion() {
+    try (InputStream in = JuiceFileSystemImpl.class.getClassLoader().getResourceAsStream("juicefs-ver.properties")) {
+      Properties prop = new Properties();
+      prop.load(in);
+      return prop.getProperty("git.commit.id.abbrev");
+    } catch (IOException e) {
+      LOG.warn("Failed to load juicefs-ver.properties", e);
+      return "unknown";
+    }
+  }
 
   private Path workingDir;
   private String name;
@@ -80,7 +94,7 @@ public class JuiceFileSystemImpl extends FileSystem {
   private int minBufferSize;
   private int cacheReplica;
   private boolean fileChecksumEnabled;
-  private Libjfs lib = loadLibrary();
+  private static Libjfs lib = loadLibrary();
 
   private long handle;
   private UserGroupInformation ugi;
@@ -106,6 +120,9 @@ public class JuiceFileSystemImpl extends FileSystem {
   private Method setStorageIds;
   private String[] storageIds;
   private Random random = new Random();
+
+  private static final String USERNAME_UID_PATTERN = "[a-zA-Z0-9_-]+:[0-9]+";
+  private static final String GROUPNAME_GID_USERNAMES_PATTERN = "[a-zA-Z0-9_-]+:[0-9]+:[,a-zA-Z0-9_-]+";
 
   /*
     go call back
@@ -299,6 +316,7 @@ public class JuiceFileSystemImpl extends FileSystem {
     return makeQualified(path).toUri().getPath();
   }
 
+  @Override
   public String getScheme() {
     return uri.getScheme();
   }
@@ -372,34 +390,34 @@ public class JuiceFileSystemImpl extends FileSystem {
     obj.put("noSession", Boolean.valueOf(getConf(conf, "no-session", "false")));
     obj.put("noBGJob", Boolean.valueOf(getConf(conf, "no-bgjob", "false")));
     obj.put("cacheDir", getConf(conf, "cache-dir", "memory"));
-    obj.put("cacheSize", Integer.valueOf(getConf(conf, "cache-size", "100")));
-    obj.put("openCache", Float.valueOf(getConf(conf, "open-cache", "0.0")));
-    obj.put("backupMeta", Integer.valueOf(getConf(conf, "backup-meta", "3600")));
+    obj.put("cacheSize", getConf(conf, "cache-size", "100"));
+    obj.put("openCache", getConf(conf, "open-cache", "0.0"));
+    obj.put("backupMeta", getConf(conf, "backup-meta", "3600"));
     obj.put("backupSkipTrash", Boolean.valueOf(getConf(conf, "backup-skip-trash", "false")));
-    obj.put("heartbeat", Integer.valueOf(getConf(conf, "heartbeat", "12")));
-    obj.put("attrTimeout", Float.valueOf(getConf(conf, "attr-cache", "0.0")));
-    obj.put("entryTimeout", Float.valueOf(getConf(conf, "entry-cache", "0.0")));
-    obj.put("dirEntryTimeout", Float.valueOf(getConf(conf, "dir-entry-cache", "0.0")));
+    obj.put("heartbeat", getConf(conf, "heartbeat", "12"));
+    obj.put("attrTimeout", getConf(conf, "attr-cache", "0.0"));
+    obj.put("entryTimeout", getConf(conf, "entry-cache", "0.0"));
+    obj.put("dirEntryTimeout", getConf(conf, "dir-entry-cache", "0.0"));
     obj.put("cacheFullBlock", Boolean.valueOf(getConf(conf, "cache-full-block", "true")));
     obj.put("cacheChecksum", getConf(conf, "verify-cache-checksum", "full"));
     obj.put("cacheEviction", getConf(conf, "cache-eviction", "2-random"));
-    obj.put("cacheScanInterval", Integer.valueOf(getConf(conf, "cache-scan-interval", "300")));
-    obj.put("cacheExpire", Integer.valueOf(getConf(conf, "cache-expire", "0")));
-    obj.put("metacache", Boolean.valueOf(getConf(conf, "metacache", "true")));
+    obj.put("cacheScanInterval", getConf(conf, "cache-scan-interval", "300"));
+    obj.put("cacheExpire", getConf(conf, "cache-expire", "0"));
     obj.put("autoCreate", Boolean.valueOf(getConf(conf, "auto-create-cache-dir", "true")));
     obj.put("maxUploads", Integer.valueOf(getConf(conf, "max-uploads", "20")));
     obj.put("maxDeletes", Integer.valueOf(getConf(conf, "max-deletes", "10")));
     obj.put("skipDirNlink", Integer.valueOf(getConf(conf, "skip-dir-nlink", "20")));
-    obj.put("uploadLimit", Integer.valueOf(getConf(conf, "upload-limit", "0")));
-    obj.put("downloadLimit", Integer.valueOf(getConf(conf, "download-limit", "0")));
+    obj.put("skipDirMtime", getConf(conf, "skip-dir-mtime", "100ms"));
+    obj.put("uploadLimit", getConf(conf, "upload-limit", "0"));
+    obj.put("downloadLimit", getConf(conf, "download-limit", "0"));
     obj.put("ioRetries", Integer.valueOf(getConf(conf, "io-retries", "10")));
-    obj.put("getTimeout", Integer.valueOf(getConf(conf, "get-timeout", getConf(conf, "object-timeout", "5"))));
-    obj.put("putTimeout", Integer.valueOf(getConf(conf, "put-timeout", getConf(conf, "object-timeout", "60"))));
-    obj.put("memorySize", Integer.valueOf(getConf(conf, "memory-size", "300")));
+    obj.put("getTimeout", getConf(conf, "get-timeout", getConf(conf, "object-timeout", "5")));
+    obj.put("putTimeout", getConf(conf, "put-timeout", getConf(conf, "object-timeout", "60")));
+    obj.put("memorySize", getConf(conf, "memory-size", "300"));
     obj.put("prefetch", Integer.valueOf(getConf(conf, "prefetch", "1")));
-    obj.put("readahead", Integer.valueOf(getConf(conf, "max-readahead", "0")));
+    obj.put("readahead", getConf(conf, "max-readahead", "0"));
     obj.put("pushGateway", getConf(conf, "push-gateway", ""));
-    obj.put("pushInterval", Integer.valueOf(getConf(conf, "push-interval", "10")));
+    obj.put("pushInterval", getConf(conf, "push-interval", "10"));
     obj.put("pushAuth", getConf(conf, "push-auth", ""));
     obj.put("pushLabels", getConf(conf, "push-labels", ""));
     obj.put("pushGraphite", getConf(conf, "push-graphite", ""));
@@ -508,13 +526,29 @@ public class JuiceFileSystemImpl extends FileSystem {
     }
   }
 
+  private String parseUidAndGrouping(String pattern, String input) {
+    String result = null;
+    if (input == null || "".equals(input.trim())) {
+      return result;
+    }
+    List<String> matched = new ArrayList<>();
+    Matcher matcher = Pattern.compile(pattern).matcher(input);
+    while (matcher.find()) {
+      matched.add(matcher.group());
+    }
+    if (matched.size() > 0) {
+      result = String.join("\n", matched);
+    }
+    return result;
+  }
+
   private void updateUidAndGrouping(String uidFile, String groupFile) throws IOException {
-    String uidstr = null;
-    if (uidFile != null && !"".equals(uidFile.trim())) {
+    String uidstr = parseUidAndGrouping(USERNAME_UID_PATTERN, uidFile);
+    if (uidstr == null && uidFile != null && !"".equals(uidFile.trim())) {
       uidstr = readFile(uidFile);
     }
-    String grouping = null;
-    if (groupFile != null && !"".equals(groupFile.trim())) {
+    String grouping = parseUidAndGrouping(GROUPNAME_GID_USERNAMES_PATTERN, groupFile);
+    if (grouping == null && groupFile != null && !"".equals(groupFile.trim())) {
       grouping = readFile(groupFile);
     }
 
@@ -590,11 +624,10 @@ public class JuiceFileSystemImpl extends FileSystem {
     LibraryLoader<Libjfs> libjfsLibraryLoader = LibraryLoader.create(Libjfs.class);
     libjfsLibraryLoader.failImmediately();
 
-    int soVer = 7;
     String osId = "so";
     String archId = "amd64";
     String resourceFormat = "libjfs-%s.%s.gz";
-    String nameFormat = "libjfs-%s.%d.%s";
+    String nameFormat = "libjfs-%s.%s.%s";
 
     File dir = new File("/tmp");
     String os = System.getProperty("os.name");
@@ -610,7 +643,7 @@ public class JuiceFileSystemImpl extends FileSystem {
     }
 
     String resource = String.format(resourceFormat, archId, osId);
-    String name = String.format(nameFormat, archId, soVer, osId);
+    String name = String.format(nameFormat, archId, gitVer, osId);
 
     File libFile = new File(dir, name);
 
@@ -778,6 +811,7 @@ public class JuiceFileSystemImpl extends FileSystem {
     return res;
   }
 
+  @Override
   public BlockLocation[] getFileBlockLocations(FileStatus file, long start, long len) throws IOException {
     if (file == null) {
       return null;
@@ -971,6 +1005,21 @@ public class JuiceFileSystemImpl extends FileSystem {
       }
     }
 
+    public synchronized void skipNBytes(long n) throws IOException {
+      if (buf == null) {
+        throw new IOException("stream was closed");
+      }
+
+      if (n <= 0) {
+        return;
+      }
+
+      long np = position + n;
+      if (np > fileLen) {
+        throw new EOFException(String.format("Unable to skip %s bytes (position=%s, fileSize=%s): %s", n, position, fileLen, np));
+      }
+      position = np;
+    }
     @Override
     public synchronized long skip(long n) throws IOException {
       if (n < 0)
@@ -1388,6 +1437,10 @@ public class JuiceFileSystemImpl extends FileSystem {
     }
     if (r == ENOENT || r == EEXIST)
       return false;
+    if (r == EACCESS) {
+      this.access(makeQualified(src).getParent(), FsAction.WRITE.or(FsAction.EXECUTE));
+      this.access(makeQualified(dst).getParent(), FsAction.WRITE.or(FsAction.EXECUTE));
+    }
     if (r < 0)
       throw error(r, src);
     return true;
@@ -1642,6 +1695,7 @@ public class JuiceFileSystemImpl extends FileSystem {
     }
   }
 
+  @Override
   public void setXAttr(Path path, String name, byte[] value, EnumSet<XAttrSetFlag> flag) throws IOException {
     Pointer buf = Memory.allocate(Runtime.getRuntime(lib), value.length);
     buf.put(0, value, 0, value.length);
@@ -1659,6 +1713,7 @@ public class JuiceFileSystemImpl extends FileSystem {
       throw error(r, path);
   }
 
+  @Override
   public byte[] getXAttr(Path path, String name) throws IOException {
     Pointer buf;
     int bufsize = 16 << 10;
@@ -1677,10 +1732,12 @@ public class JuiceFileSystemImpl extends FileSystem {
     return value;
   }
 
+  @Override
   public Map<String, byte[]> getXAttrs(Path path) throws IOException {
     return getXAttrs(path, listXAttrs(path));
   }
 
+  @Override
   public Map<String, byte[]> getXAttrs(Path path, List<String> names) throws IOException {
     Map<String, byte[]> result = new HashMap<String, byte[]>();
     for (String n : names) {
@@ -1692,6 +1749,7 @@ public class JuiceFileSystemImpl extends FileSystem {
     return result;
   }
 
+  @Override
   public List<String> listXAttrs(Path path) throws IOException {
     Pointer buf;
     int bufsize = 1024;
@@ -1717,6 +1775,7 @@ public class JuiceFileSystemImpl extends FileSystem {
     return result;
   }
 
+  @Override
   public void removeXAttr(Path path, String name) throws IOException {
     int r = lib.jfs_removeXattr(Thread.currentThread().getId(), handle, normalizePath(path), name);
     if (r == ENOATTR || r == ENODATA) {

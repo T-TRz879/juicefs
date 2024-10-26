@@ -17,9 +17,12 @@
 package sync
 
 import (
+	"math"
 	"os"
 	"strings"
+	"time"
 
+	"github.com/juicedata/juicefs/pkg/utils"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/urfave/cli/v2"
 )
@@ -32,6 +35,7 @@ type Config struct {
 	Update         bool
 	ForceUpdate    bool
 	Perms          bool
+	MaxFailure     int64
 	Dry            bool
 	DeleteSrc      bool
 	DeleteDst      bool
@@ -49,12 +53,16 @@ type Config struct {
 	ManagerAddr    string
 	ListThreads    int
 	ListDepth      int
-	BWLimit        int
+	BWLimit        int64
 	NoHTTPS        bool
 	Verbose        bool
 	Quiet          bool
 	CheckAll       bool
 	CheckNew       bool
+	MaxSize        int64
+	MinSize        int64
+	MaxAge         time.Duration
+	MinAge         time.Duration
 	Env            map[string]string
 
 	rules          []rule
@@ -144,6 +152,7 @@ func NewConfigFromCli(c *cli.Context) *Config {
 		Perms:          c.Bool("perms"),
 		Dirs:           c.Bool("dirs"),
 		Dry:            c.Bool("dry"),
+		MaxFailure:     c.Int64("max-failure"),
 		DeleteSrc:      c.Bool("delete-src"),
 		DeleteDst:      c.Bool("delete-dst"),
 		Exclude:        c.StringSlice("exclude"),
@@ -157,13 +166,26 @@ func NewConfigFromCli(c *cli.Context) *Config {
 		Workers:        c.StringSlice("worker"),
 		ManagerAddr:    c.String("manager-addr"),
 		Manager:        c.String("manager"),
-		BWLimit:        c.Int("bwlimit"),
+		BWLimit:        utils.ParseMbps(c, "bwlimit"),
 		NoHTTPS:        c.Bool("no-https"),
 		Verbose:        c.Bool("verbose"),
 		Quiet:          c.Bool("quiet"),
 		CheckAll:       c.Bool("check-all"),
 		CheckNew:       c.Bool("check-new"),
+		MaxSize:        int64(utils.ParseBytes(c, "max-size", 'B')),
+		MinSize:        int64(utils.ParseBytes(c, "min-size", 'B')),
+		MaxAge:         utils.Duration(c.String("max-age")),
+		MinAge:         utils.Duration(c.String("min-age")),
 		Env:            make(map[string]string),
+	}
+	if !c.IsSet("max-size") {
+		cfg.MaxSize = math.MaxInt64
+	}
+	if cfg.MinSize > cfg.MaxSize {
+		logger.Fatal("min-size should not be larger than max-size")
+	}
+	if cfg.MaxAge > 0 && cfg.MinAge > cfg.MaxAge {
+		logger.Fatal("min-age should not be larger than max-age")
 	}
 	if cfg.Threads <= 0 {
 		logger.Warnf("threads should be larger than 0, reset it to 1")

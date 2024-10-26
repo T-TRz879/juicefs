@@ -18,10 +18,12 @@ package cmd
 
 import (
 	"compress/gzip"
+	"errors"
 	"io"
 	"os"
 	"strings"
 
+	"github.com/DataDog/zstd"
 	"github.com/juicedata/juicefs/pkg/meta"
 	"github.com/urfave/cli/v2"
 )
@@ -55,6 +57,11 @@ Details: https://juicefs.com/docs/community/metadata_dump_load`,
 				Name:  "keep-secret-key",
 				Usage: "keep secret keys intact (WARNING: Be careful as they may be leaked)",
 			},
+			&cli.IntFlag{
+				Name:  "threads",
+				Value: 10,
+				Usage: "number of threads to dump metadata",
+			},
 			&cli.BoolFlag{
 				Name:  "fast",
 				Usage: "speedup dump by load all metadata into memory",
@@ -67,39 +74,51 @@ Details: https://juicefs.com/docs/community/metadata_dump_load`,
 	}
 }
 
-func dump(ctx *cli.Context) (err error) {
-	setup(ctx, 1)
-	metaUri := ctx.Args().Get(0)
-	dst := ctx.Args().Get(1)
-	removePassword(metaUri)
+func dumpMeta(m meta.Meta, dst string, threads int, keepSecret, fast, skipTrash bool) (err error) {
 	var w io.WriteCloser
-	if ctx.Args().Len() == 1 {
+	if dst == "" {
 		w = os.Stdout
-		dst = "STDOUT"
 	} else {
-		fp, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
-		if err != nil {
-			return err
+		tmp := dst + ".tmp"
+		fp, e := os.Create(tmp)
+		if e != nil {
+			return e
 		}
 		defer func() {
-			e := fp.Close()
+			err = errors.Join(err, fp.Close())
 			if err == nil {
-				err = e
+				err = os.Rename(tmp, dst)
+			} else {
+				_ = os.Remove(tmp)
 			}
 		}()
+
 		if strings.HasSuffix(dst, ".gz") {
-			zw := gzip.NewWriter(fp)
+			w, _ = gzip.NewWriterLevel(fp, gzip.BestSpeed)
 			defer func() {
-				e := zw.Close()
-				if err == nil {
-					err = e
-				}
+				err = errors.Join(err, w.Close())
 			}()
-			w = zw
+		} else if strings.HasSuffix(dst, ".zstd") {
+			w = zstd.NewWriterLevel(fp, zstd.BestSpeed)
+			defer func() {
+				err = errors.Join(err, w.Close())
+			}()
 		} else {
 			w = fp
 		}
 	}
+	return m.DumpMeta(w, 1, threads, keepSecret, fast, skipTrash)
+}
+
+func dump(ctx *cli.Context) error {
+	setup(ctx, 1)
+	metaUri := ctx.Args().Get(0)
+	var dst string
+	if ctx.Args().Len() > 1 {
+		dst = ctx.Args().Get(1)
+	}
+	removePassword(metaUri)
+
 	metaConf := meta.DefaultConf()
 	metaConf.Subdir = ctx.String("subdir")
 	m := meta.NewClient(metaUri, metaConf)
@@ -109,9 +128,18 @@ func dump(ctx *cli.Context) (err error) {
 	if st := m.Chroot(meta.Background, metaConf.Subdir); st != 0 {
 		return st
 	}
-	if err := m.DumpMeta(w, 1, ctx.Bool("keep-secret-key"), ctx.Bool("fast"), ctx.Bool("skip-trash")); err != nil {
-		return err
+
+	threads := ctx.Int("threads")
+	if threads <= 0 {
+		logger.Warnf("Invalid threads number %d, reset to 1", threads)
+		threads = 1
 	}
-	logger.Infof("Dump metadata into %s succeed", dst)
-	return nil
+	err := dumpMeta(m, dst, threads, ctx.Bool("keep-secret-key"), ctx.Bool("fast"), ctx.Bool("skip-trash"))
+	if err == nil {
+		if dst == "" {
+			dst = "STDOUT"
+		}
+		logger.Infof("Dump metadata into %s succeed", dst)
+	}
+	return err
 }

@@ -58,7 +58,7 @@ func (s *sqlStore) String() string {
 	return fmt.Sprintf("%s://%s/", driver, s.addr)
 }
 
-func (s *sqlStore) Get(key string, off, limit int64) (io.ReadCloser, error) {
+func (s *sqlStore) Get(key string, off, limit int64, getters ...AttrGetter) (io.ReadCloser, error) {
 	var b = blob{Key: []byte(key)}
 	// TODO: range
 	ok, err := s.db.Get(&b)
@@ -78,7 +78,7 @@ func (s *sqlStore) Get(key string, off, limit int64) (io.ReadCloser, error) {
 	return io.NopCloser(bytes.NewBuffer(data)), nil
 }
 
-func (s *sqlStore) Put(key string, in io.Reader) error {
+func (s *sqlStore) Put(key string, in io.Reader, getters ...AttrGetter) error {
 	d, err := io.ReadAll(in)
 	if err != nil {
 		return err
@@ -123,7 +123,7 @@ func (s *sqlStore) Head(key string) (Object, error) {
 	}, nil
 }
 
-func (s *sqlStore) Delete(key string) error {
+func (s *sqlStore) Delete(key string, getters ...AttrGetter) error {
 	_, err := s.db.Delete(&blob{Key: []byte(key)})
 	return err
 }
@@ -168,9 +168,9 @@ func newSQLStore(driver, addr, user, password string) (ObjectStorage, error) {
 		uri = "postgres://" + uri
 		driver = "pgx"
 
-		parse, err := url.Parse(addr)
+		parse, err := url.Parse(uri)
 		if err != nil {
-			return nil, fmt.Errorf("parse url %s failed: %s", addr, err)
+			return nil, fmt.Errorf("parse url %s failed: %s", uri, err)
 		}
 		searchPath = parse.Query().Get("search_path")
 		if searchPath != "" {

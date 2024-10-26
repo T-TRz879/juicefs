@@ -17,12 +17,10 @@
 package cmd
 
 import (
+	"fmt"
 	"os"
 	"path"
 	"runtime"
-	"strconv"
-	"strings"
-	"time"
 
 	"github.com/urfave/cli/v2"
 )
@@ -109,15 +107,15 @@ func storageFlags() []cli.Flag {
 			Name:  "storage-class",
 			Usage: "the storage class for data written by current client",
 		},
-		&cli.IntFlag{
+		&cli.StringFlag{
 			Name:  "get-timeout",
-			Value: 60,
-			Usage: "the max number of seconds to download an object",
+			Value: "60s",
+			Usage: "the timeout to download an object",
 		},
-		&cli.IntFlag{
+		&cli.StringFlag{
 			Name:  "put-timeout",
-			Value: 60,
-			Usage: "the max number of seconds to upload an object",
+			Value: "60s",
+			Usage: "the timeout to upload an object",
 		},
 		&cli.IntFlag{
 			Name:  "io-retries",
@@ -130,15 +128,20 @@ func storageFlags() []cli.Flag {
 			Usage: "number of connections to upload",
 		},
 		&cli.IntFlag{
+			Name:  "max-stage-write",
+			Value: 0, // Enable this to have concurrent uploads to two backends, and get write bandwidth equals to sum of the two
+			Usage: "number of threads allowed to write staged files, other requests will be uploaded directly (this option is only effective when 'writeback' mode is enabled)",
+		},
+		&cli.IntFlag{
 			Name:  "max-deletes",
 			Value: 10,
 			Usage: "number of threads to delete objects",
 		},
-		&cli.Int64Flag{
+		&cli.StringFlag{
 			Name:  "upload-limit",
 			Usage: "bandwidth limit for upload in Mbps",
 		},
-		&cli.Int64Flag{
+		&cli.StringFlag{
 			Name:  "download-limit",
 			Usage: "bandwidth limit for download in Mbps",
 		},
@@ -164,10 +167,14 @@ func dataCacheFlags() []cli.Flag {
 		defaultCacheDir = path.Join(homeDir, ".juicefs", "cache")
 	}
 	return addCategories("DATA CACHE", []cli.Flag{
-		&cli.IntFlag{
+		&cli.StringFlag{
 			Name:  "buffer-size",
-			Value: 300,
-			Usage: "total read/write buffering in MB",
+			Value: "300M",
+			Usage: "total read/write buffering in MiB",
+		},
+		&cli.StringFlag{
+			Name:  "max-readahead",
+			Usage: "max buffering for read ahead in MiB per read session",
 		},
 		&cli.IntFlag{
 			Name:  "prefetch",
@@ -180,8 +187,8 @@ func dataCacheFlags() []cli.Flag {
 		},
 		&cli.StringFlag{
 			Name:  "upload-delay",
-			Value: "0",
-			Usage: "delayed duration (in seconds) for uploading blocks",
+			Value: "0s",
+			Usage: "delayed duration for uploading blocks",
 		},
 		&cli.StringFlag{
 			Name:  "upload-hours",
@@ -197,9 +204,9 @@ func dataCacheFlags() []cli.Flag {
 			Value: "0600", // only owner can read/write cache
 			Usage: "file permissions for cached blocks",
 		},
-		&cli.IntFlag{
+		&cli.StringFlag{
 			Name:  "cache-size",
-			Value: 100 << 10,
+			Value: "100G",
 			Usage: "size of cached object for read in MiB",
 		},
 		&cli.Float64Flag{
@@ -223,12 +230,12 @@ func dataCacheFlags() []cli.Flag {
 		},
 		&cli.StringFlag{
 			Name:  "cache-scan-interval",
-			Value: "3600",
-			Usage: "interval (in seconds) to scan cache-dir to rebuild in-memory index",
+			Value: "1h",
+			Usage: "interval to scan cache-dir to rebuild in-memory index",
 		},
 		&cli.StringFlag{
 			Name:  "cache-expire",
-			Value: "0",
+			Value: "0s",
 			Usage: "cached blocks not accessed for longer than this option will be automatically evicted (0 means never)",
 		},
 	})
@@ -242,8 +249,8 @@ func metaFlags() []cli.Flag {
 		},
 		&cli.StringFlag{
 			Name:  "backup-meta",
-			Value: "3600",
-			Usage: "interval (in seconds) to automatically backup metadata in the object storage (0 means disable backup)",
+			Value: "1h",
+			Usage: "interval to automatically backup metadata in the object storage (0 means disable backup)",
 		},
 		&cli.BoolFlag{
 			Name:  "backup-skip-trash",
@@ -251,8 +258,8 @@ func metaFlags() []cli.Flag {
 		},
 		&cli.StringFlag{
 			Name:  "heartbeat",
-			Value: "12",
-			Usage: "interval (in seconds) to send heartbeat; it's recommended that all clients use the same heartbeat value",
+			Value: "12s",
+			Usage: "interval to send heartbeat; it's recommended that all clients use the same heartbeat value",
 		},
 		&cli.BoolFlag{
 			Name:  "read-only",
@@ -276,6 +283,10 @@ func metaFlags() []cli.Flag {
 			Name:  "skip-dir-mtime",
 			Value: "100ms",
 			Usage: "skip updating attribute of a directory if the mtime difference is smaller than this value",
+		},
+		&cli.BoolFlag{
+			Name:  "sort-dir",
+			Usage: "sort entries within a directory by name",
 		},
 	})
 }
@@ -314,27 +325,27 @@ func shareInfoFlags() []cli.Flag {
 
 func metaCacheFlags(defaultEntryCache float64) []cli.Flag {
 	return addCategories("META CACHE", []cli.Flag{
-		&cli.Float64Flag{
+		&cli.StringFlag{
 			Name:  "attr-cache",
-			Value: 1.0,
-			Usage: "attributes cache timeout in seconds",
+			Value: "1.0s",
+			Usage: "attributes cache timeout",
 		},
-		&cli.Float64Flag{
+		&cli.StringFlag{
 			Name:  "entry-cache",
-			Value: defaultEntryCache,
-			Usage: "file entry cache timeout in seconds",
+			Value: fmt.Sprintf("%.1fs", defaultEntryCache),
+			Usage: "file entry cache timeout",
 		},
-		&cli.Float64Flag{
+		&cli.StringFlag{
 			Name:  "dir-entry-cache",
-			Value: 1.0,
-			Usage: "dir entry cache timeout in seconds",
+			Value: "1.0s",
+			Usage: "dir entry cache timeout",
 		},
-		&cli.Float64Flag{
+		&cli.StringFlag{
 			Name:  "open-cache",
-			Value: 0.0,
-			Usage: "The seconds to reuse open file without checking update (0 means disable this feature)",
+			Value: "0s",
+			Usage: "The cache time to reuse open file without checking update (0 means disable this feature)",
 		},
-		&cli.IntFlag{
+		&cli.Uint64Flag{
 			Name:  "open-cache-limit",
 			Value: 10000,
 			Usage: "max number of open files to cache (soft limit, 0 means unlimited)",
@@ -348,27 +359,4 @@ func expandFlags(compoundFlags ...[]cli.Flag) []cli.Flag {
 		flags = append(flags, flag...)
 	}
 	return flags
-}
-
-func duration(s string) time.Duration {
-	v, err := strconv.Atoi(s)
-	if err == nil {
-		return time.Second * time.Duration(v)
-	}
-
-	err = nil
-	var d time.Duration
-	p := strings.Index(s, "d")
-	if p >= 0 {
-		v, err = strconv.Atoi(s[:p])
-	}
-	if err == nil {
-		d, err = time.ParseDuration(s[p+1:])
-	}
-
-	if err != nil {
-		logger.Warnf("Invalid duration value: %s, setting it to 0", s)
-		return 0
-	}
-	return d + time.Hour*time.Duration(v*24)
 }

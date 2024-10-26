@@ -18,6 +18,7 @@ package gateway
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -76,6 +77,14 @@ type jfsObjects struct {
 	gConf    *Config
 }
 
+func (n *jfsObjects) PutObjectMetadata(ctx context.Context, s string, s2 string, options minio.ObjectOptions) (minio.ObjectInfo, error) {
+	return minio.ObjectInfo{}, minio.NotImplemented{}
+}
+
+func (n *jfsObjects) NSScanner(ctx context.Context, bf *minio.BloomFilter, updates chan<- madmin.DataUsageInfo) error {
+	return nil
+}
+
 func (n *jfsObjects) IsCompressionSupported() bool {
 	return false
 }
@@ -95,7 +104,7 @@ func (n *jfsObjects) Shutdown(ctx context.Context) error {
 
 func (n *jfsObjects) StorageInfo(ctx context.Context) (info minio.StorageInfo, errors []error) {
 	sinfo := minio.StorageInfo{}
-	sinfo.Backend.Type = minio.BackendFS
+	sinfo.Backend.Type = madmin.FS
 	return sinfo, nil
 }
 
@@ -166,7 +175,7 @@ func (n *jfsObjects) isValidBucketName(bucket string) error {
 }
 
 func (n *jfsObjects) path(p ...string) string {
-	if len(p) > 0 && p[0] == n.conf.Format.Name {
+	if !n.gConf.MultiBucket && len(p) > 0 && p[0] == n.conf.Format.Name {
 		p = p[1:]
 	}
 	return sep + minio.PathJoin(p...)
@@ -191,6 +200,10 @@ func (n *jfsObjects) DeleteBucket(ctx context.Context, bucket string, forceDelet
 	if !n.gConf.MultiBucket {
 		return minio.BucketNotEmpty{Bucket: bucket}
 	}
+	if eno := n.fs.Delete(mctx, n.path(minio.MinioMetaBucket, minio.BucketMetaPrefix, bucket, minio.BucketMetadataFile)); eno != 0 {
+		logger.Errorf("delete bucket metadata: %s", eno)
+	}
+	_ = n.fs.Delete(mctx, n.path(minio.MinioMetaBucket, minio.BucketMetaPrefix, bucket))
 	eno := n.fs.Delete(mctx, n.path(bucket))
 	return jfsToObjectErr(ctx, eno, bucket)
 }
@@ -205,6 +218,12 @@ func (n *jfsObjects) MakeBucketWithLocation(ctx context.Context, bucket string, 
 		}
 	}
 	eno := n.fs.Mkdir(mctx, n.path(bucket), 0777, n.gConf.Umask)
+	if eno == 0 {
+		metadata := minio.NewBucketMetadata(bucket)
+		if err := metadata.Save(ctx, n); err != nil {
+			return err
+		}
+	}
 	return jfsToObjectErr(ctx, eno, bucket)
 }
 
@@ -272,22 +291,8 @@ func (n *jfsObjects) ListBuckets(ctx context.Context) (buckets []minio.BucketInf
 	return buckets, nil
 }
 
-func (n *jfsObjects) isObjectDir(ctx context.Context, bucket, object string) bool {
-	f, eno := n.fs.Open(mctx, n.path(bucket, object), 0)
-	if eno != 0 {
-		return false
-	}
-	defer f.Close(mctx)
-
-	fis, err := f.Readdir(mctx, 0)
-	if err != 0 {
-		return false
-	}
-	return len(fis) == 0
-}
-
 func (n *jfsObjects) isLeafDir(bucket, leafPath string) bool {
-	return n.isObjectDir(context.Background(), bucket, leafPath)
+	return false
 }
 
 func (n *jfsObjects) isLeaf(bucket, leafPath string) bool {
@@ -295,14 +300,14 @@ func (n *jfsObjects) isLeaf(bucket, leafPath string) bool {
 }
 
 func (n *jfsObjects) listDirFactory() minio.ListDirFunc {
-	return func(bucket, prefixDir, prefixEntry string) (emptyDir bool, entries []string, delayIsLeaf bool) {
+	return func(bucket, prefixDir, prefixEntry string) (emptyDir bool, entries []*minio.Entry, delayIsLeaf bool) {
 		f, eno := n.fs.Open(mctx, n.path(bucket, prefixDir), 0)
 		if eno != 0 {
 			return fs.IsNotExist(eno), nil, false
 		}
 		defer f.Close(mctx)
 		if fi, _ := f.Stat(); fi.(*fs.FileStat).Atime() == 0 && prefixEntry == "" {
-			entries = append(entries, "")
+			entries = append(entries, &minio.Entry{Name: ""})
 		}
 
 		fis, eno := f.Readdir(mctx, 0)
@@ -314,11 +319,30 @@ func (n *jfsObjects) listDirFactory() minio.ListDirFunc {
 			if root && (fi.Name() == metaBucket || fi.Name() == minio.MinioMetaBucket) {
 				continue
 			}
-			if fi.IsDir() {
-				entries = append(entries, fi.Name()+sep)
-			} else {
-				entries = append(entries, fi.Name())
+			if stat, ok := fi.(*fs.FileStat); ok && stat.IsSymlink() {
+				var err syscall.Errno
+				p := n.path(bucket, prefixDir, fi.Name())
+				if fi, err = n.fs.Stat(mctx, p); err != 0 {
+					logger.Errorf("stat %s: %s", p, err)
+					continue
+				}
 			}
+			entry := &minio.Entry{Name: fi.Name(),
+				Info: &minio.ObjectInfo{
+					Bucket:  bucket,
+					Name:    fi.Name(),
+					ModTime: fi.ModTime(),
+					Size:    fi.Size(),
+					IsDir:   fi.IsDir(),
+					AccTime: fi.ModTime(),
+				},
+			}
+
+			if fi.IsDir() {
+				entry.Name += sep
+				entry.Info.Size = 0
+			}
+			entries = append(entries, entry)
 		}
 		if len(entries) == 0 {
 			return true, nil, false
@@ -343,37 +367,48 @@ func (n *jfsObjects) ListObjects(ctx context.Context, bucket, prefix, marker, de
 	if err := n.checkBucket(ctx, bucket); err != nil {
 		return loi, err
 	}
-	getObjectInfo := func(ctx context.Context, bucket, object string) (obj minio.ObjectInfo, err error) {
-		fi, eno := n.fs.Stat(mctx, n.path(bucket, object))
-		if eno == 0 {
-			size := fi.Size()
-			if fi.IsDir() {
-				size = 0
+	getObjectInfo := func(ctx context.Context, bucket, object string, info *minio.ObjectInfo) (obj minio.ObjectInfo, err error) {
+		var eno syscall.Errno
+		if info == nil {
+			var fi *fs.FileStat
+			fi, eno = n.fs.Stat(mctx, n.path(bucket, object))
+			if eno == 0 {
+				size := fi.Size()
+				if fi.IsDir() {
+					size = 0
+				}
+				info = &minio.ObjectInfo{
+					Bucket:  bucket,
+					ModTime: fi.ModTime(),
+					Size:    size,
+					IsDir:   fi.IsDir(),
+					AccTime: fi.ModTime(),
+				}
 			}
-			obj = minio.ObjectInfo{
-				Bucket:  bucket,
-				Name:    object,
-				ModTime: fi.ModTime(),
-				Size:    size,
-				IsDir:   fi.IsDir(),
-				AccTime: fi.ModTime(),
+
+			// replace links to external file systems with empty files
+			if errors.Is(eno, syscall.ENOTSUP) {
+				now := time.Now()
+				info = &minio.ObjectInfo{
+					Bucket:  bucket,
+					ModTime: now,
+					Size:    0,
+					IsDir:   false,
+					AccTime: now,
+				}
+				eno = 0
 			}
 		}
 
-		// replace links to external file systems with empty files
-		if eno == syscall.ENOTSUP {
-			now := time.Now()
-			obj = minio.ObjectInfo{
-				Bucket:  bucket,
-				Name:    object,
-				ModTime: now,
-				Size:    0,
-				IsDir:   false,
-				AccTime: now,
-			}
-			eno = 0
+		if info == nil {
+			return obj, jfsToObjectErr(ctx, eno, bucket, object)
 		}
-		return obj, jfsToObjectErr(ctx, eno, bucket, object)
+		info.Name = object
+		if n.gConf.KeepEtag && !strings.HasSuffix(object, sep) {
+			etag, _ := n.fs.GetXattr(mctx, n.path(bucket, object), s3Etag)
+			info.ETag = string(etag)
+		}
+		return *info, jfsToObjectErr(ctx, eno, bucket, object)
 	}
 
 	if maxKeys == 0 {
@@ -1030,7 +1065,7 @@ func (n *jfsObjects) CompleteMultipartUpload(ctx context.Context, bucket, object
 	var total uint64
 	for _, part := range parts {
 		p := n.ppath(bucket, uploadID, strconv.Itoa(part.PartNumber))
-		copied, eno := n.fs.CopyFileRange(mctx, p, 0, tmp, total, 1<<30)
+		copied, eno := n.fs.CopyFileRange(mctx, p, 0, tmp, total, 5<<30)
 		if eno != 0 {
 			err = jfsToObjectErr(ctx, eno, bucket, object, uploadID)
 			logger.Errorf("merge parts: %s", err)
@@ -1143,12 +1178,133 @@ func (n *jfsObjects) cleanup() {
 	}
 }
 
-func (n *jfsObjects) NewNSLock(bucket string, objects ...string) minio.RWLocker {
-	return n.nsMutex.NewNSLock(nil, bucket, objects...)
+type jfsFLock struct {
+	inode     meta.Ino
+	owner     uint64
+	meta      meta.Meta
+	localLock sync.RWMutex
 }
 
-func (n *jfsObjects) BackendInfo() minio.BackendInfo {
-	return minio.BackendInfo{Type: minio.BackendFS}
+func (j *jfsFLock) GetLock(ctx context.Context, timeout *minio.DynamicTimeout) (newCtx context.Context, timedOutErr error) {
+	return j.getFlockWithTimeOut(ctx, meta.F_WRLCK, timeout)
+}
+
+func (j *jfsFLock) getFlockWithTimeOut(ctx context.Context, ltype uint32, timeout *minio.DynamicTimeout) (context.Context, error) {
+	if os.Getenv("JUICEFS_META_READ_ONLY") != "" {
+		return ctx, nil
+	}
+	if j.inode == 0 {
+		logger.Warnf("failed to get lock")
+		return ctx, nil
+	}
+	start := time.Now()
+	deadline := start.Add(timeout.Timeout())
+	lockStr := "write"
+
+	var getLockFunc func() bool
+	var unlockFunc func()
+	var getLock bool
+	if ltype == meta.F_RDLCK {
+		getLockFunc = j.localLock.TryRLock
+		unlockFunc = j.localLock.RUnlock
+		lockStr = "read"
+	} else {
+		getLockFunc = j.localLock.TryLock
+		unlockFunc = j.localLock.Unlock
+	}
+
+	for {
+		getLock = getLockFunc()
+		if getLock {
+			break
+		}
+		if time.Now().After(deadline) {
+			timeout.LogFailure()
+			logger.Errorf("get %s lock timed out ino:%d", lockStr, j.inode)
+			return ctx, minio.OperationTimedOut{}
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	for {
+		if errno := j.meta.Flock(mctx, j.inode, j.owner, ltype, false); errno != 0 {
+			if !errors.Is(errno, syscall.EAGAIN) {
+				logger.Errorf("failed to get %s lock for inode %d by owner %d, error : %s", lockStr, j.inode, j.owner, errno)
+			}
+		} else {
+			timeout.LogSuccess(time.Since(start))
+			return ctx, nil
+		}
+
+		if time.Now().After(deadline) {
+			unlockFunc()
+			timeout.LogFailure()
+			logger.Errorf("get %s lock timed out ino:%d", lockStr, j.inode)
+			return ctx, minio.OperationTimedOut{}
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func (j *jfsFLock) Unlock() {
+	if j.inode == 0 || os.Getenv("JUICEFS_META_READ_ONLY") != "" {
+		return
+	}
+	if errno := j.meta.Flock(mctx, j.inode, j.owner, meta.F_UNLCK, true); errno != 0 {
+		logger.Errorf("failed to release lock for inode %d by owner %d, error : %s", j.inode, j.owner, errno)
+	}
+	j.localLock.Unlock()
+}
+
+func (j *jfsFLock) GetRLock(ctx context.Context, timeout *minio.DynamicTimeout) (newCtx context.Context, timedOutErr error) {
+	return j.getFlockWithTimeOut(ctx, meta.F_RDLCK, timeout)
+}
+
+func (j *jfsFLock) RUnlock() {
+	if j.inode == 0 || os.Getenv("JUICEFS_META_READ_ONLY") != "" {
+		return
+	}
+	if errno := j.meta.Flock(mctx, j.inode, j.owner, meta.F_UNLCK, true); errno != 0 {
+		logger.Errorf("failed to release lock for inode %d by owner %d, error : %s", j.inode, j.owner, errno)
+	}
+	j.localLock.RUnlock()
+}
+
+func (n *jfsObjects) NewNSLock(bucket string, objects ...string) minio.RWLocker {
+	if os.Getenv("JUICEFS_META_READ_ONLY") != "" {
+		return &jfsFLock{}
+	}
+	if len(objects) != 1 {
+		panic(fmt.Errorf("jfsObjects.NewNSLock: the length of the objects parameter must be 1, current %s", objects))
+	}
+
+	lockfile := path.Join(minio.MinioMetaBucket, minio.MinioMetaLockFile)
+	var file *fs.File
+	var errno syscall.Errno
+	file, errno = n.fs.Open(mctx, lockfile, vfs.MODE_MASK_W)
+	if errno != 0 && !errors.Is(errno, syscall.ENOENT) {
+		logger.Errorf("failed to open the file to be locked: %s error %s", lockfile, errno)
+		return &jfsFLock{}
+	}
+	if errors.Is(errno, syscall.ENOENT) {
+		if file, errno = n.fs.Create(mctx, lockfile, 0666, n.gConf.Umask); errno != 0 {
+			if errors.Is(errno, syscall.EEXIST) {
+				if file, errno = n.fs.Open(mctx, lockfile, vfs.MODE_MASK_W); errno != 0 {
+					logger.Errorf("failed to open the file to be locked: %s error %s", lockfile, errno)
+					return &jfsFLock{}
+				}
+			} else {
+				logger.Errorf("failed to create gateway lock file err %s", errno)
+				return &jfsFLock{}
+			}
+		}
+	}
+	defer file.Close(mctx)
+	return &jfsFLock{owner: n.conf.Meta.Sid, inode: file.Inode(), meta: n.fs.Meta()}
+}
+
+func (n *jfsObjects) BackendInfo() madmin.BackendInfo {
+	return madmin.BackendInfo{Type: madmin.FS}
 }
 
 func (n *jfsObjects) LocalStorageInfo(ctx context.Context) (minio.StorageInfo, []error) {
@@ -1159,7 +1315,7 @@ func (n *jfsObjects) ListObjectVersions(ctx context.Context, bucket, prefix, mar
 	return loi, minio.NotImplemented{}
 }
 
-func (n *jfsObjects) getObjectInfoNoFSLock(ctx context.Context, bucket, object string) (oi minio.ObjectInfo, e error) {
+func (n *jfsObjects) getObjectInfoNoFSLock(ctx context.Context, bucket, object string, info *minio.ObjectInfo) (oi minio.ObjectInfo, e error) {
 	return n.GetObjectInfo(ctx, bucket, object, minio.ObjectOptions{})
 }
 
@@ -1271,10 +1427,6 @@ func (n *jfsObjects) DeleteObjectTags(ctx context.Context, bucket, object string
 		return minio.ObjectInfo{}, errno
 	}
 	return n.GetObjectInfo(ctx, bucket, object, opts)
-}
-
-func (n *jfsObjects) CrawlAndGetDataUsage(ctx context.Context, bf *minio.BloomFilter, updates chan<- minio.DataUsageInfo) error {
-	return nil
 }
 
 func (n *jfsObjects) IsNotificationSupported() bool {

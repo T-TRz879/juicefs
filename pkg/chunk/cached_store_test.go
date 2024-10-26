@@ -65,6 +65,12 @@ func testStore(t *testing.T, store ChunkStore) {
 	} else if string(p.Data[:n]) != "world" {
 		t.Fatalf("not expected: %s", string(p.Data[:n]))
 	}
+	p = NewPage(make([]byte, 5))
+	if n, err := reader.ReadAt(context.Background(), p, 0); n != 5 || err != nil {
+		t.Fatalf("read failed: %d %s", n, err)
+	} else if string(p.Data[:n]) != "hello" {
+		t.Fatalf("not expected: %s", string(p.Data[:n]))
+	}
 	p = NewPage(make([]byte, 20))
 	if n, err := reader.ReadAt(context.Background(), p, offset); n != 11 || err != nil && err != io.EOF {
 		t.Fatalf("read failed: %d %s", n, err)
@@ -95,7 +101,7 @@ var defaultConf = Config{
 	BlockSize:         1 << 20,
 	CacheDir:          filepath.Join(os.TempDir(), "diskCache"),
 	CacheMode:         0600,
-	CacheSize:         10,
+	CacheSize:         10 << 20,
 	CacheChecksum:     CsNone,
 	CacheScanInterval: time.Second * 300,
 	MaxUpload:         1,
@@ -144,8 +150,8 @@ func TestStoreCompressed(t *testing.T) {
 func TestStoreLimited(t *testing.T) {
 	mem, _ := object.CreateStorage("mem", "", "", "", "")
 	conf := defaultConf
-	conf.UploadLimit = 1 << 20
-	conf.DownloadLimit = 1 << 20
+	conf.UploadLimit = 1e6
+	conf.DownloadLimit = 1e6
 	store := NewCachedStore(mem, conf, nil)
 	testStore(t, store)
 }
@@ -217,7 +223,7 @@ func TestStoreMultiBuckets(t *testing.T) {
 func TestFillCache(t *testing.T) {
 	mem, _ := object.CreateStorage("mem", "", "", "", "")
 	conf := defaultConf
-	conf.CacheSize = 10
+	conf.CacheSize = 10 << 20
 	conf.FreeSpace = 0.01
 	_ = os.RemoveAll(conf.CacheDir)
 	store := NewCachedStore(mem, conf, nil)

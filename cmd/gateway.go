@@ -28,11 +28,12 @@ import (
 	"path"
 	"strconv"
 	"syscall"
-	"time"
 
 	"github.com/juicedata/juicefs/pkg/chunk"
 	"github.com/juicedata/juicefs/pkg/fs"
 	"github.com/juicedata/juicefs/pkg/meta"
+	"github.com/juicedata/juicefs/pkg/object"
+	"github.com/juicedata/juicefs/pkg/utils"
 	"github.com/juicedata/juicefs/pkg/vfs"
 
 	jfsgateway "github.com/juicedata/juicefs/pkg/gateway"
@@ -83,6 +84,11 @@ func cmdGateway() *cli.Command {
 			Name:  "domain",
 			Usage: "domain for virtual-host-style requests",
 		},
+		&cli.StringFlag{
+			Name:  "refresh-iam-interval",
+			Value: "5m",
+			Usage: "interval to reload gateway IAM from configuration",
+		},
 	}
 
 	return &cli.Command{
@@ -126,9 +132,13 @@ func gateway(c *cli.Context) error {
 		os.Setenv("MINIO_DOMAIN", c.String("domain"))
 	}
 
+	if c.IsSet("refresh-iam-interval") {
+		os.Setenv("MINIO_REFRESH_IAM_INTERVAL", c.String("refresh-iam-interval"))
+	}
+
 	metaAddr := c.Args().Get(0)
 	listenAddr := c.Args().Get(1)
-	conf, jfs := initForSvc(c, "s3gateway", metaAddr)
+	conf, jfs := initForSvc(c, "s3gateway", metaAddr, listenAddr)
 
 	umask, err := strconv.ParseUint(c.String("umask"), 8, 16)
 	if err != nil {
@@ -148,10 +158,13 @@ func gateway(c *cli.Context) error {
 	if err != nil {
 		return err
 	}
-
-	if _, err := jfsGateway.GetBucketInfo(context.Background(), minio.MinioMetaBucket); errors.As(err, &minio.BucketNotFound{}) {
-		if err := jfsGateway.MakeBucketWithLocation(context.Background(), minio.MinioMetaBucket, minio.BucketOptions{}); err != nil {
-			logger.Fatalf("init MinioMetaBucket error %s: %s", minio.MinioMetaBucket, err)
+	if c.IsSet("read-only") {
+		os.Setenv("JUICEFS_META_READ_ONLY", "1")
+	} else {
+		if _, err := jfsGateway.GetBucketInfo(context.Background(), minio.MinioMetaBucket); errors.As(err, &minio.BucketNotFound{}) {
+			if err := jfsGateway.MakeBucketWithLocation(context.Background(), minio.MinioMetaBucket, minio.BucketOptions{}); err != nil {
+				logger.Fatalf("init MinioMetaBucket error %s: %s", minio.MinioMetaBucket, err)
+			}
 		}
 	}
 
@@ -191,13 +204,12 @@ func gateway2(ctx *mcli.Context) error {
 	return nil
 }
 
-func initForSvc(c *cli.Context, mp string, metaUrl string) (*vfs.Config, *fs.FileSystem) {
+func initForSvc(c *cli.Context, mp string, metaUrl, listenAddr string) (*vfs.Config, *fs.FileSystem) {
 	removePassword(metaUrl)
 	metaConf := getMetaConf(c, mp, c.Bool("read-only"))
 	metaCli := meta.NewClient(metaUrl, metaConf)
-
 	if c.Bool("background") {
-		if err := makeDaemonForSvc(c, metaCli); err != nil {
+		if err := makeDaemonForSvc(c, metaCli, metaUrl, listenAddr); err != nil {
 			logger.Fatalf("make daemon: %s", err)
 		}
 	}
@@ -240,13 +252,14 @@ func initForSvc(c *cli.Context, mp string, metaUrl string) (*vfs.Config, *fs.Fil
 		if err := metaCli.CloseSession(); err != nil {
 			logger.Fatalf("close session failed: %s", err)
 		}
+		object.Shutdown(blob)
 		os.Exit(0)
 	}()
 	vfsConf := getVfsConf(c, metaConf, format, chunkConf)
 	vfsConf.AccessLog = c.String("access-log")
-	vfsConf.AttrTimeout = time.Millisecond * time.Duration(c.Float64("attr-cache")*1000)
-	vfsConf.EntryTimeout = time.Millisecond * time.Duration(c.Float64("entry-cache")*1000)
-	vfsConf.DirEntryTimeout = time.Millisecond * time.Duration(c.Float64("dir-entry-cache")*1000)
+	vfsConf.AttrTimeout = utils.Duration(c.String("attr-cache"))
+	vfsConf.EntryTimeout = utils.Duration(c.String("entry-cache"))
+	vfsConf.DirEntryTimeout = utils.Duration(c.String("dir-entry-cache"))
 
 	initBackgroundTasks(c, vfsConf, metaConf, metaCli, blob, registerer, registry)
 	jfs, err := fs.NewFileSystem(vfsConf, metaCli, store)

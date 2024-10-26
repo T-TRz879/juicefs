@@ -26,6 +26,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -42,12 +43,17 @@ import (
 	"time"
 
 	"github.com/juicedata/godaemon"
+	"github.com/urfave/cli/v2"
+
 	"github.com/juicedata/juicefs/pkg/fuse"
 	"github.com/juicedata/juicefs/pkg/meta"
+	"github.com/juicedata/juicefs/pkg/object"
 	"github.com/juicedata/juicefs/pkg/utils"
+	"github.com/juicedata/juicefs/pkg/version"
 	"github.com/juicedata/juicefs/pkg/vfs"
-	"github.com/urfave/cli/v2"
 )
+
+var mountPid int
 
 func showThreadStack(agentAddr string) {
 	if agentAddr == "" {
@@ -115,7 +121,7 @@ func loadConfig(path string) (string, *vfs.Config, error) {
 			return d, &conf, err
 		}
 		if !os.IsNotExist(err) {
-			logger.Fatalf("read .config: %s", err)
+			return "", nil, fmt.Errorf("read %s: %w", d, err)
 		}
 	}
 	return "", nil, fmt.Errorf("%s is not inside JuiceFS", path)
@@ -149,7 +155,10 @@ func watchdog(ctx context.Context, mp string) {
 					if err == nil {
 						logger.Infof("watching %s, pid %d", mp, conf.Pid)
 						pid = conf.Pid
-						agentAddr = conf.DebugAgent
+						agentAddr = conf.Port.DebugAgent
+					} else {
+						logger.Warnf("load config: %s", err)
+						continue
 					}
 				}
 			}
@@ -176,7 +185,25 @@ func watchdog(ctx context.Context, mp string) {
 	}
 }
 
+// parseFuseFd checks if `mountPoint` is the special form /dev/fd/N (with N >= 0),
+// and returns N in this case. Returns -1 otherwise.
+func parseFuseFd(mountPoint string) (fd int) {
+	dir, file := path.Split(mountPoint)
+	if dir != "/dev/fd/" {
+		return -1
+	}
+	fd, err := strconv.Atoi(file)
+	if err != nil || fd <= 0 {
+		return -1
+	}
+	return fd
+}
+
 func checkMountpoint(name, mp, logPath string, background bool) {
+	if parseFuseFd(mp) > 0 {
+		logger.Infof("\033[92mOK\033[0m, %s with special mount point %s", name, mp)
+		return
+	}
 	mountTimeOut := 10 // default 10 seconds
 	interval := 500    // check every 500 Millisecond
 	if tStr, ok := os.LookupEnv("JFS_MOUNT_TIMEOUT"); ok {
@@ -199,28 +226,61 @@ func checkMountpoint(name, mp, logPath string, background bool) {
 		_ = os.Stdout.Sync()
 	}
 	_, _ = os.Stdout.WriteString("\n")
+	mountDesc := "mount process is not started yet"
+	if mountPid != 0 {
+		mountDesc = fmt.Sprintf("tried to kill mount process %d", mountPid)
+		_ = syscall.Kill(mountPid, syscall.SIGABRT) // Kill and show stack trace
+	}
 	if background {
-		logger.Fatalf("The mount point is not ready in %d seconds, please check the log (%s) or re-mount in foreground", mountTimeOut, logPath)
+		logger.Fatalf("The mount point is not ready in %d seconds (%s), please check the log (%s) or re-mount in foreground", mountTimeOut, mountDesc, logPath)
 	} else {
-		logger.Fatalf("The mount point is not ready in %d seconds, exit it", mountTimeOut)
+		logger.Fatalf("The mount point is not ready in %d seconds (%s), exit it", mountTimeOut, mountDesc)
 	}
 }
 
-func makeDaemonForSvc(c *cli.Context, m meta.Meta) error {
+func checkSvcPort(address string) {
+	mountTimeOut := 10
+	interval := 500
+	for i := 0; i < mountTimeOut*1000/interval; i++ {
+		time.Sleep(time.Duration(interval) * time.Millisecond)
+		conn, err := net.DialTimeout("tcp", address, 500*time.Millisecond)
+		if err == nil {
+			_ = conn.Close()
+			logger.Infof("\033[92mOK\033[0m, service is ready on %s", address)
+			return
+		}
+		_, _ = os.Stdout.WriteString(".")
+		_ = os.Stdout.Sync()
+	}
+	_, _ = os.Stdout.WriteString("\n")
+	logger.Fatalf("The service is not ready in %d seconds, please check the log or restart in foreground", mountTimeOut)
+}
+
+func makeDaemonForSvc(c *cli.Context, m meta.Meta, metaUrl, listenAddr string) error {
+	cacheDirPathToAbs(c)
+	_ = expandPathForEmbedded(metaUrl)
+
 	var attrs godaemon.DaemonAttr
 	logfile := c.String("log")
 	attrs.OnExit = func(stage int) error {
+		if stage == 0 {
+			checkSvcPort(listenAddr)
+		}
 		return nil
 	}
 
-	// the current dir will be changed to root in daemon,
-	// so the mount point has to be an absolute path.
 	if godaemon.Stage() == 0 {
 		var err error
 		attrs.Stdout, err = os.OpenFile(logfile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 		logger.Infof("open log file %s: %s", logfile, err)
 		if err != nil {
 			logger.Errorf("open log file %s: %s", logfile, err)
+		}
+
+		conn, err := net.DialTimeout("tcp", listenAddr, 500*time.Millisecond)
+		if err == nil {
+			_ = conn.Close()
+			logger.Fatalf("unable to start the server: %s is already in use", listenAddr)
 		}
 	}
 	if godaemon.Stage() <= 1 {
@@ -231,6 +291,10 @@ func makeDaemonForSvc(c *cli.Context, m meta.Meta) error {
 	}
 	_, _, err := godaemon.MakeDaemon(&attrs)
 	return err
+}
+
+func getDaemonStage() int {
+	return int(godaemon.Stage())
 }
 
 func fuseFlags() []cli.Flag {
@@ -255,6 +319,11 @@ func fuseFlags() []cli.Flag {
 			Name:   "non-default-permission",
 			Usage:  "disable `default_permissions` option, only for testing",
 			Hidden: true,
+		},
+		&cli.StringFlag{
+			Name:  "max-write",
+			Usage: "maximum write size for fuse request",
+			Value: "128K",
 		},
 		&cli.StringFlag{
 			Name:  "o",
@@ -351,8 +420,8 @@ func getFuserMountVersion() string {
 }
 
 func setFuseOption(c *cli.Context, format *meta.Format, vfsConf *vfs.Config) {
-	rawOpts, mt, noxattr, noacl := genFuseOptExt(c, format.Name)
-	options := vfs.FuseOptions(fuse.GenFuseOpt(vfsConf, rawOpts, mt, noxattr, noacl))
+	rawOpts, mt, noxattr, noacl, maxWrite := genFuseOptExt(c, format)
+	options := vfs.FuseOptions(fuse.GenFuseOpt(vfsConf, rawOpts, mt, noxattr, noacl, maxWrite))
 	vfsConf.FuseOpts = &options
 }
 
@@ -381,7 +450,11 @@ func genFuseOpt(c *cli.Context, name string) string {
 }
 
 func prepareMp(mp string) {
+	if csiCommPath != "" {
+		return
+	}
 	var fi os.FileInfo
+	var ino uint64
 	err := utils.WithTimeout(func() error {
 		var err error
 		fi, err = os.Stat(mp)
@@ -401,7 +474,7 @@ func prepareMp(mp string) {
 			}
 		}
 	} else if err == nil {
-		ino, _ := utils.GetFileInode(mp)
+		ino, _ = utils.GetFileInode(mp)
 		if ino <= uint64(meta.RootInode) && fi.Size() == 0 {
 			// a broken mount point, umount it
 			logger.Infof("mountpoint %s is broken (ino=%d, size=%d), umount it", mp, ino, fi.Size())
@@ -410,6 +483,9 @@ func prepareMp(mp string) {
 	}
 
 	if os.Getuid() == 0 {
+		return
+	}
+	if ino == uint64(meta.RootInode) {
 		return
 	}
 	switch runtime.GOOS {
@@ -432,13 +508,12 @@ func prepareMp(mp string) {
 	}
 }
 
-func genFuseOptExt(c *cli.Context, name string) (fuseOpt string, mt int, noxattr, noacl bool) {
+func genFuseOptExt(c *cli.Context, format *meta.Format) (fuseOpt string, mt int, noxattr, noacl bool, maxWrite int) {
 	enableXattr := c.Bool("enable-xattr")
-	// todo: wait for the implementation of acl
-	if c.Bool("enable-acl") {
+	if format.EnableACL {
 		enableXattr = true
 	}
-	return genFuseOpt(c, name), 1, !enableXattr, !c.Bool("enable-acl")
+	return genFuseOpt(c, format.Name), 1, !enableXattr, !format.EnableACL, int(utils.ParseBytes(c, "max-write", 'B'))
 }
 
 func shutdownGraceful(mp string) {
@@ -448,6 +523,10 @@ func shutdownGraceful(mp string) {
 		return
 	}
 	fuseFd, fuseSetting = getFuseFd(conf.CommPath)
+	for i := 0; i < 100 && fuseFd == 0; i++ {
+		time.Sleep(time.Millisecond * 100)
+		fuseFd, fuseSetting = getFuseFd(conf.CommPath)
+	}
 	if fuseFd == 0 {
 		logger.Warnf("fail to recv FUSE fd from %s", conf.CommPath)
 		return
@@ -461,15 +540,17 @@ func shutdownGraceful(mp string) {
 		time.Sleep(time.Millisecond * 100)
 	}
 	logger.Infof("mount point %s is busy, stop upgrade, mount on top of it", mp)
-	err = sendFuseFd(conf.CommPath, string(fuseSetting), fuseFd)
+	err = sendFuseFd(conf.CommPath, fuseSetting, fuseFd)
 	if err != nil {
 		logger.Warnf("send FUSE fd: %s", err)
 	}
+	_ = syscall.Close(fuseFd)
 	fuseFd = 0
+	fuseSetting = []byte("FUSE")
 }
 
 func canShutdownGracefully(mp string, newConf *vfs.Config) bool {
-	if runtime.GOOS != "linux" {
+	if csiCommPath != "" {
 		return false
 	}
 	var ino uint64
@@ -499,6 +580,10 @@ func canShutdownGracefully(mp string, newConf *vfs.Config) bool {
 	if oldConf.Format.Name != newConf.Format.Name {
 		logger.Infof("different volume %s != %s, mount on top of it", oldConf.Format.Name, newConf.Format.Name)
 		return false
+	}
+	oldVersion := version.Parse(oldConf.Version)
+	if ret, _ := version.CompareVersions(oldVersion, version.Parse("1.2.0")); ret <= 0 {
+		oldConf.FuseOpts.MaxWrite = 128 * 1024
 	}
 	if oldConf.FuseOpts != nil && !reflect.DeepEqual(oldConf.FuseOpts.StripOptions(), newConf.FuseOpts.StripOptions()) {
 		logger.Infof("different options, mount on top of it: %v != %v", oldConf.FuseOpts.StripOptions(), newConf.FuseOpts.StripOptions())
@@ -613,7 +698,7 @@ func adjustOOMKiller(score int) {
 	}
 }
 
-func installHandler(mp string, v *vfs.VFS) {
+func installHandler(mp string, v *vfs.VFS, blob object.ObjectStorage) {
 	// Go will catch all the signals
 	signal.Ignore(syscall.SIGPIPE)
 	signalChan := make(chan os.Signal, 10)
@@ -624,12 +709,13 @@ func installHandler(mp string, v *vfs.VFS) {
 			logger.Infof("Received signal %s, exiting...", sig.String())
 			if sig == syscall.SIGHUP {
 				path := fmt.Sprintf("/tmp/state%d.json", os.Getppid())
-				if err := v.FlushAll(path); err == nil {
+				if err := v.FlushAll(""); err == nil {
 					fuse.Shutdown()
 					err = v.FlushAll(path)
 					if err != nil {
 						logger.Fatalf("flush buffered data failed: %s", err)
 					}
+					object.Shutdown(blob)
 					logger.Warnf("exit with code 1")
 					os.Exit(1)
 				} else {
@@ -642,7 +728,8 @@ func installHandler(mp string, v *vfs.VFS) {
 				if err := v.FlushAll(""); err != nil {
 					logger.Errorf("flush all: %s", err)
 				}
-				logger.Fatalf("exit after received %s,but umount not finished after 30 seconds, force exit", sig)
+				logger.Errorf("exit after receiving signal %s, but umount does not finish in 30 seconds, force exit", sig)
+				os.Exit(meta.UmountCode)
 			}()
 			go func() { _ = doUmount(mp, true) }()
 		}
@@ -652,12 +739,12 @@ func launchMount(mp string, conf *vfs.Config) error {
 	increaseRlimit()
 	if runtime.GOOS == "linux" {
 		adjustOOMKiller(-1000)
-		if canShutdownGracefully(mp, conf) {
-			shutdownGraceful(mp)
-		}
-		os.Setenv("_FUSE_FD_COMM", serverAddress)
-		serveFuseFD(serverAddress)
 	}
+	if canShutdownGracefully(mp, conf) {
+		shutdownGraceful(mp)
+	}
+	os.Setenv("_FUSE_FD_COMM", serverAddress)
+	serveFuseFD(serverAddress)
 
 	path, err := os.Executable()
 	if err != nil {
@@ -680,6 +767,7 @@ func launchMount(mp string, conf *vfs.Config) error {
 			}
 		}
 
+		mountPid = 0
 		cmd := exec.Command(path, os.Args[1:]...)
 		cmd.Stdin = os.Stdin
 		cmd.Stdout = os.Stdout
@@ -691,19 +779,47 @@ func launchMount(mp string, conf *vfs.Config) error {
 			continue
 		}
 		os.Unsetenv("_FUSE_STATE_PATH")
+		mountPid = cmd.Process.Pid
+
+		signalChan := make(chan os.Signal, 10)
+		signal.Notify(signalChan, syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP)
+		go func() {
+			for {
+				sig := <-signalChan
+				if sig == nil {
+					return
+				}
+				logger.Infof("received signal %s, propagating to child process %d...", sig.String(), mountPid)
+				if err := cmd.Process.Signal(sig); err != nil {
+					logger.Errorf("send signal %s to %d: %s", sig.String(), mountPid, err)
+				}
+			}
+		}()
 
 		ctx, cancel := context.WithCancel(context.TODO())
 		go watchdog(ctx, mp)
 		err = cmd.Wait()
 		cancel()
+		signal.Stop(signalChan)
+		close(signalChan)
 		if err == nil {
 			return nil
+		} else {
+			var exitError *exec.ExitError
+			if ok := errors.As(err, &exitError); ok {
+				if waitStatus, ok := exitError.Sys().(syscall.WaitStatus); ok && waitStatus.ExitStatus() == meta.UmountCode {
+					logger.Errorf("received umount exit code")
+					_ = doUmount(mp, true)
+					return nil
+				}
+			}
+			if fuseFd < 0 {
+				logger.Info("transfer FUSE session to others")
+				return nil
+			}
+			logger.Errorf("mount process %d: %s, will restart in 1 second", mountPid, err)
+			time.Sleep(time.Second)
 		}
-		if fuseFd < 0 {
-			logger.Info("transfer FUSE session to others")
-			return nil
-		}
-		time.Sleep(time.Second)
 	}
 }
 
@@ -712,9 +828,9 @@ func mountMain(v *vfs.VFS, c *cli.Context) {
 		disableUpdatedb()
 	}
 	conf := v.Conf
-	conf.AttrTimeout = time.Millisecond * time.Duration(c.Float64("attr-cache")*1000)
-	conf.EntryTimeout = time.Millisecond * time.Duration(c.Float64("entry-cache")*1000)
-	conf.DirEntryTimeout = time.Millisecond * time.Duration(c.Float64("dir-entry-cache")*1000)
+	conf.AttrTimeout = utils.Duration(c.String("attr-cache"))
+	conf.EntryTimeout = utils.Duration(c.String("entry-cache"))
+	conf.DirEntryTimeout = utils.Duration(c.String("dir-entry-cache"))
 	conf.NonDefaultPermission = c.Bool("non-default-permission")
 	rootSquash := c.String("root-squash")
 	if rootSquash != "" {

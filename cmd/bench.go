@@ -17,7 +17,6 @@
 package cmd
 
 import (
-	"crypto/rand"
 	"fmt"
 	"os"
 	"os/exec"
@@ -28,6 +27,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/dustin/go-humanize"
 	"github.com/juicedata/juicefs/pkg/utils"
 	"github.com/urfave/cli/v2"
 )
@@ -53,19 +53,19 @@ $ juicefs bench /mnt/jfs --big-file-size 0
 
 Details: https://juicefs.com/docs/community/performance_evaluation_guide#juicefs-bench`,
 		Flags: []cli.Flag{
-			&cli.UintFlag{
+			&cli.StringFlag{
 				Name:  "block-size",
-				Value: 1,
+				Value: "1M",
 				Usage: "size of each IO block in MiB",
 			},
-			&cli.UintFlag{
+			&cli.StringFlag{
 				Name:  "big-file-size",
-				Value: 1024,
+				Value: "1G",
 				Usage: "size of each big file in MiB",
 			},
-			&cli.UintFlag{
+			&cli.StringFlag{
 				Name:  "small-file-size",
-				Value: 128,
+				Value: "128K",
 				Usage: "size of each small file in KiB",
 			},
 			&cli.UintFlag{
@@ -113,12 +113,6 @@ type benchmark struct {
 	tmpdir     string
 }
 
-func randRead(buf []byte) {
-	if _, err := rand.Read(buf); err != nil {
-		logger.Fatalf("Generate random content: %s", err)
-	}
-}
-
 func (bc *benchCase) writeFiles(index int) {
 	for i := 0; i < bc.fcount; i++ {
 		fname := filepath.Join(bc.bm.tmpdir, fmt.Sprintf("%s.%d.%d", bc.name, index, i))
@@ -127,7 +121,7 @@ func (bc *benchCase) writeFiles(index int) {
 			logger.Fatalf("Failed to open file %s: %s", fname, err)
 		}
 		buf := make([]byte, bc.bsize)
-		randRead(buf)
+		utils.RandRead(buf)
 		for j := 0; j < bc.bcount; j++ {
 			if _, err = fp.Write(buf); err != nil {
 				logger.Fatalf("Failed to write file %s: %s", fname, err)
@@ -190,14 +184,13 @@ func (bc *benchCase) run(test string) float64 {
 	return time.Since(start).Seconds()
 }
 
-// blockSize, bigSize in MiB; smallSize in KiB
 func newBenchmark(tmpdir string, blockSize, bigSize, smallSize, smallCount, threads int) *benchmark {
 	bm := &benchmark{threads: threads, tmpdir: tmpdir}
 	if bigSize > 0 {
-		bm.big = bm.newCase("bigfile", bigSize<<20, 1, blockSize<<20)
+		bm.big = bm.newCase("bigfile", bigSize, 1, blockSize)
 	}
 	if smallSize > 0 && smallCount > 0 {
-		bm.small = bm.newCase("smallfile", smallSize<<10, smallCount, blockSize<<20)
+		bm.small = bm.newCase("smallfile", smallSize, smallCount, blockSize)
 	}
 	return bm
 }
@@ -315,16 +308,19 @@ func printResult(result [][]string, leftAlign int, colorful bool) {
 func bench(ctx *cli.Context) error {
 	setup(ctx, 1)
 	/* --- Pre-check --- */
-	if ctx.Uint("block-size") == 0 || ctx.Uint("threads") == 0 {
+	blockSize := utils.ParseBytes(ctx, "block-size", 'M')
+	if blockSize == 0 || ctx.Uint("threads") == 0 {
 		return os.ErrInvalid
 	}
 	tmpdir, err := filepath.Abs(ctx.Args().First())
 	if err != nil {
 		logger.Fatalf("Failed to get absolute path of %s: %s", ctx.Args().First(), err)
 	}
+	bigSize := utils.ParseBytes(ctx, "big-file-size", 'M')
+	smallSize := utils.ParseBytes(ctx, "small-file-size", 'K')
 	tmpdir = filepath.Join(tmpdir, fmt.Sprintf("__juicefs_benchmark_%d__", time.Now().UnixNano()))
-	bm := newBenchmark(tmpdir, int(ctx.Uint("block-size")), int(ctx.Uint("big-file-size")),
-		int(ctx.Uint("small-file-size")), int(ctx.Uint("small-file-count")), int(ctx.Uint("threads")))
+	bm := newBenchmark(tmpdir, int(blockSize), int(bigSize), int(smallSize),
+		int(ctx.Uint("small-file-count")), int(ctx.Uint("threads")))
 	if bm.big == nil && bm.small == nil {
 		return os.ErrInvalid
 	}
@@ -436,8 +432,9 @@ func bench(ctx *cli.Context) error {
 
 	/* --- Report --- */
 	fmt.Println("Benchmark finished!")
-	fmt.Printf("BlockSize: %d MiB, BigFileSize: %d MiB, SmallFileSize: %d KiB, SmallFileCount: %d, NumThreads: %d\n",
-		ctx.Uint("block-size"), ctx.Uint("big-file-size"), ctx.Uint("small-file-size"), ctx.Uint("small-file-count"), ctx.Uint("threads"))
+	fmt.Printf("BlockSize: %s, BigFileSize: %s, SmallFileSize: %s, SmallFileCount: %d, NumThreads: %d\n",
+		humanize.IBytes(blockSize), humanize.IBytes(bigSize), humanize.IBytes(smallSize),
+		ctx.Uint("small-file-count"), ctx.Uint("threads"))
 	if stats != nil {
 		stats2 := readStats(mp)
 		diff := func(item string) float64 {

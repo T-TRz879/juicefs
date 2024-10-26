@@ -1,24 +1,24 @@
-name: "fsrand2"
+name: "xattr"
 
 on:
   push:
     branches:
-    - main
-    - release**
+      - 'main'
+      - 'release-**'
     paths:
-    - '**/fsrand2.yml'
-    - '**/fsrand2.py'
-    - '**/fsrand2_test.py'
+      - '**.go'
+      - '**.c'
+      - '**/xattr.yml'
   pull_request:
     branches:
-    - main
-    - release**
+      - 'main'
+      - 'release-**'
     paths:
-    - '**/fsrand2.yml'
-    - '**/fsrand2.py'
-    - '**/fsrand2_test.py'
+      - '**.go'
+      - '**.c'
+      - '**/xattr.yml'
   schedule:
-    - cron:  '0 16 * * 0'
+    - cron:  '0 19 * * *'
   workflow_dispatch:
     inputs:
       debug:
@@ -26,17 +26,37 @@ on:
         description: "Run the build with tmate debugging enabled"
         required: false
         default: false
+
 jobs:
-  fsrand2:
-    timeout-minutes: 60
+  build-matrix:
+    runs-on: ubuntu-20.04
+    steps:
+      - id: set-matrix
+        run: |
+          echo "github.event_name is ${{github.event_name}}"
+          if [[ "${{github.event_name}}" == "schedule" || "${{github.event_name}}" == "workflow_dispatch" ]]; then
+            echo 'meta_matrix=["sqlite3", "redis", "mysql", "tikv", "badger", "postgres", "mariadb", "fdb"]' >> $GITHUB_OUTPUT
+          elif [[ "${{github.event_name}}" == "pull_request" || "${{github.event_name}}" == "push"  ]]; then
+            echo 'meta_matrix=["redis"]' >> $GITHUB_OUTPUT
+          else
+            echo 'event name is not supported' && exit 1
+          fi
+    outputs:
+      meta_matrix: ${{ steps.set-matrix.outputs.meta_matrix }}
+
+  xattr:
+    needs: build-matrix
     strategy:
       fail-fast: false
       matrix:
-        meta: ['redis', 'mysql', 'tikv']
-        # meta: ['redis']
-        
-    runs-on: ubuntu-latest
+        meta: ${{ fromJson(needs.build-matrix.outputs.meta_matrix) }}
+    runs-on: ubuntu-20.04
+
     steps:
+      - uses: shogo82148/actions-setup-perl@v1
+        with:
+          perl-version: '5.34'
+
       - name: Checkout
         uses: actions/checkout@v3
         with:
@@ -50,9 +70,8 @@ jobs:
           else
             echo "target=juicefs" >> $GITHUB_OUTPUT
           fi
-  
+
       - name: Build
-        timeout-minutes: 10
         uses: ./.github/actions/build
         with: 
           target: ${{steps.vars.outputs.target}}
@@ -65,57 +84,37 @@ jobs:
           meta_url=$(get_meta_url ${{matrix.meta}})
           create_database $meta_url
 
-      - name: Install tool
-        run: | 
-          sudo .github/scripts/apt_install.sh attr
-          sudo pip install xattr
-          sudo pip install minio
-
       - name: Juicefs Format
         run: |
           source .github/scripts/start_meta_engine.sh
           meta_url=$(get_meta_url ${{matrix.meta}})
-          ./juicefs format $meta_url --enable-acl --trash-days 0 myjfs
+          sudo ./juicefs format $meta_url --trash-days 0 pics
 
       - name: Juicefs Mount
         run: |
           source .github/scripts/start_meta_engine.sh
           meta_url=$(get_meta_url ${{matrix.meta}})
-          sudo ./juicefs mount -d $meta_url /tmp/myjfs --no-usage-report --enable-xattr 
-          if [ ! -f /tmp/myjfs/.accesslog ]; then
-            echo "<FATAL>: mount failed"
-            exit 1
-          fi
-          
-      - name: Run Examples
-        timeout-minutes: 10
-        run: |
-          sudo -E python3 .github/scripts/hypo/fsrand2_test.py
-          sudo -E python3 .github/scripts/hypo/acl_test.py
-          
+          # sudo mkdir /var/jfs
+          # sudo chmod 777 /var/jfs
+          sudo ./juicefs mount -d $meta_url /tmp/jfs --no-usage-report --enable-xattr
+          stat /tmp/jfs/.accesslog
+
       - name: Test
-        timeout-minutes: 120
         run: |
-          if [ "${{ github.event_name }}" == "schedule" ]; then
-            PROFILE='schedule'
+          git clone https://github.com/iustin/pyxattr.git
+          cd pyxattr
+          pip3 install pytest
+          pip3 install pyxattr
+          stat /tmp/jfs/
+          if [[ "${{matrix.meta}}" == "tikv" || "${{matrix.meta}}" == "badger" ]]; then
+            TEST_DIR=/tmp/jfs/ python3 -m pytest tests -k "not test_empty_value"
           else
-            PROFILE='pull_request'
+            TEST_DIR=/tmp/jfs/ python3 -m pytest tests
           fi
-          sudo -E PROFILE=${PROFILE} python3 .github/scripts/hypo/fsrand2.py 2>&1 | tee fsrand.log
-          exit ${PIPESTATUS[0]}
-
-      - name: check fsrand.log
+          
+      - name: log
         if: always()
         run: | 
-          tail -500 fsrand.log
-
-      - name: check juicefs.log
-        if: always()
-        run: | 
-          if [ -f ~/.juicefs/juicefs.log ]; then
-            tail -300 ~/.juicefs/juicefs.log
-            grep "<FATAL>:" ~/.juicefs/juicefs.log && exit 1 || true
-          fi
           if [ -f /var/log/juicefs.log ]; then
             tail -300 /var/log/juicefs.log
             grep "<FATAL>:" /var/log/juicefs.log && exit 1 || true
@@ -123,13 +122,12 @@ jobs:
 
       - name: Setup upterm session
         if: failure() && (github.event.inputs.debug == 'true' || github.run_attempt != 1)
-        # if: failure() 
         timeout-minutes: 60
         uses: lhotari/action-upterm@v1
 
   success-all-test:
     runs-on: ubuntu-latest
-    needs: [fsrand2]
+    needs: [xattr]
     if: always()
     steps:
       - uses: technote-space/workflow-conclusion-action@v3
@@ -147,5 +145,5 @@ jobs:
           slack_bot_token: "${{ secrets.SLACK_BOT_TOKEN }}"
 
       - name: Success
-        if: success()
+        if: success() 
         run: echo "All Done"

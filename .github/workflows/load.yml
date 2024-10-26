@@ -4,16 +4,20 @@ on:
     branches:
       - 'main'
       - 'release-**'
-    paths-ignore:
-      - 'docs/**'
-      - '**.md'
+    paths:
+      - '**.go'
+      - 'Makefile'
+      - '**/load.yml'
+      - '.github/scripts/command/load_dump_bench.sh'
   pull_request:
     branches:
       - 'main'
       - 'release-**'
-    paths-ignore:
-      - 'docs/**'
-      - '**.md'
+    paths:
+      - '**.go'
+      - 'Makefile'
+      - '**/load.yml'
+      - '.github/scripts/command/load_dump_bench.sh'
   schedule:
     - cron:  '0 19 * * *'
   workflow_dispatch:
@@ -43,7 +47,6 @@ jobs:
 
   load:
     timeout-minutes: 30
-    if: github.repository == 'juicedata/juicefs'
     needs: [build-matrix]
     strategy:
       fail-fast: false
@@ -88,23 +91,38 @@ jobs:
       - name: Load and dump with small directory
         timeout-minutes: 30
         run: |
-          sudo MYSQL_PASSWORD=${{secrets.MYSQL_PASSWORD_FOR_JUICEDATA}} META=${{matrix.meta}} START_META=true .github/scripts/command/load_dump_bench.sh test_load_dump_with_small_dir
+          sudo AWS_ACCESS_KEY_ID=${{secrets.CI_AWS_ACCESS_KEY_ID}} AWS_SECRET_ACCESS_KEY=${{secrets.CI_AWS_ACCESS_KEY_SECRET}} META=${{matrix.meta}} START_META=true .github/scripts/command/load_dump_bench.sh test_load_dump_with_small_dir
 
       - name: Load and dump with big directory
         timeout-minutes: 30
+        env:
+          AWS_ACCESS_KEY_ID: ${{secrets.CI_AWS_ACCESS_KEY_ID}}
+          AWS_SECRET_ACCESS_KEY: ${{secrets.CI_AWS_ACCESS_KEY_SECRET}}
+          META: ${{matrix.meta}}
+          START_META: false
         run: |
-          sudo MYSQL_PASSWORD=${{secrets.MYSQL_PASSWORD_FOR_JUICEDATA}} META=${{matrix.meta}} START_META=false .github/scripts/command/load_dump_bench.sh test_load_dump_with_big_dir
+          sudo -E .github/scripts/command/load_dump_bench.sh test_load_dump_with_big_dir
       
       - name: Load and dump subdir with big directory
         if: false
         timeout-minutes: 30
+        env:
+          AWS_ACCESS_KEY_ID: ${{secrets.CI_AWS_ACCESS_KEY_ID}}
+          AWS_SECRET_ACCESS_KEY: ${{secrets.CI_AWS_ACCESS_KEY_SECRET}}
+          META: ${{matrix.meta}} 
+          START_META: false 
         run: |
-          sudo MYSQL_PASSWORD=${{secrets.MYSQL_PASSWORD_FOR_JUICEDATA}} META=${{matrix.meta}} START_META=false .github/scripts/command/load_dump_bench.sh test_load_dump_with_big_dir_subdir
+          sudo -E .github/scripts/command/load_dump_bench.sh test_load_dump_with_big_dir_subdir
           
       - name: List big directory
         timeout-minutes: 30
+        env:
+          AWS_ACCESS_KEY_ID: ${{secrets.CI_AWS_ACCESS_KEY_ID}}
+          AWS_SECRET_ACCESS_KEY: ${{secrets.CI_AWS_ACCESS_KEY_SECRET}}
+          META: ${{matrix.meta}} 
+          START_META: false 
         run: | 
-          sudo MYSQL_PASSWORD=${{secrets.MYSQL_PASSWORD_FOR_JUICEDATA}} META=${{matrix.meta}} START_META=false .github/scripts/command/load_dump_bench.sh test_list_with_big_dir
+          sudo -E .github/scripts/command/load_dump_bench.sh test_list_with_big_dir
 
       - name: log
         if: always()

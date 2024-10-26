@@ -62,9 +62,9 @@ func Backup(m meta.Meta, blob object.ObjectStorage, interval time.Duration, skip
 			continue
 		}
 		if now := time.Now(); now.Sub(last) >= interval {
+			var iused, dummy uint64
+			_ = m.StatFS(ctx, meta.RootInode, &dummy, &dummy, &iused, &dummy)
 			if interval <= time.Hour {
-				var iused, dummy uint64
-				_ = m.StatFS(ctx, meta.RootInode, &dummy, &dummy, &iused, &dummy)
 				if iused > 1e6 {
 					logger.Warnf("backup metadata skipped because of too many inodes: %d %s; "+
 						"you may increase `--backup-meta` to enable it again", iused, interval)
@@ -77,35 +77,42 @@ func Backup(m meta.Meta, blob object.ObjectStorage, interval time.Duration, skip
 			}
 			go cleanupBackups(blob, now)
 			logger.Debugf("backup metadata started")
-			if err = backup(m, blob, now, skipTrash); err == nil {
+			if fpath, err := backup(m, blob, now, iused < 1e5, skipTrash); err == nil {
 				LastBackupTimeG.Set(float64(now.UnixNano()) / 1e9)
-				logger.Infof("backup metadata succeed, used %s", time.Since(now))
+				logger.Infof("backup metadata succeed, fast mode: %v, path: %q, used %s", iused < 1e5, fpath, time.Since(now))
 			} else {
 				logger.Warnf("backup metadata failed: %s", err)
 			}
 			LastBackupDurationG.Set(time.Since(now).Seconds())
+		} else {
+			LastBackupDurationG.Set(0)
 		}
 	}
 }
 
-func backup(m meta.Meta, blob object.ObjectStorage, now time.Time, skipTrash bool) error {
+func backup(m meta.Meta, blob object.ObjectStorage, now time.Time, fast, skipTrash bool) (string, error) {
 	name := "dump-" + now.UTC().Format("2006-01-02-150405") + ".json.gz"
 	fp, err := os.CreateTemp("", "juicefs-meta-*")
 	if err != nil {
-		return err
+		return "", err
 	}
 	defer os.Remove(fp.Name())
 	defer fp.Close()
-	zw := gzip.NewWriter(fp)
-	err = m.DumpMeta(zw, 0, false, false, skipTrash) // force dump the whole tree
+	zw, _ := gzip.NewWriterLevel(fp, gzip.BestSpeed)
+	var threads = 2
+	if m.Name() == "tikv" {
+		threads = 10
+	}
+	err = m.DumpMeta(zw, 0, threads, false, fast, skipTrash) // force dump the whole tree
 	_ = zw.Close()
 	if err != nil {
-		return err
+		return "", err
 	}
 	if _, err = fp.Seek(0, io.SeekStart); err != nil {
-		return err
+		return "", err
 	}
-	return blob.Put("meta/"+name, fp)
+	fpath := "meta/" + name
+	return blob.String() + fpath, blob.Put(fpath, fp)
 }
 
 func cleanupBackups(blob object.ObjectStorage, now time.Time) {

@@ -28,6 +28,7 @@ import (
 	"time"
 
 	"github.com/juicedata/juicefs/pkg/version"
+	"github.com/pkg/errors"
 )
 
 // Config for clients.
@@ -48,6 +49,7 @@ type Config struct {
 	DirStatFlushPeriod time.Duration
 	SkipDirMtime       time.Duration
 	Sid                uint64
+	SortDir            bool
 }
 
 func DefaultConf() *Config {
@@ -63,7 +65,7 @@ func (c *Config) SelfCheck() {
 		c.Heartbeat = time.Second
 	}
 	if c.Heartbeat > time.Minute*10 {
-		logger.Warnf("heartbeat shouldd not be greater than 10 minutes")
+		logger.Warnf("heartbeat should not be greater than 10 minutes")
 		c.Heartbeat = time.Minute * 10
 	}
 }
@@ -148,8 +150,18 @@ func (f *Format) CheckVersion() error {
 		return fmt.Errorf("incompatible metadata version: %d; please upgrade the client", f.MetaVersion)
 	}
 
+	ver := version.GetVersion()
+	return f.CheckCliVersion(&ver)
+}
+
+func (f *Format) CheckCliVersion(ver *version.Semver) error {
+	if ver == nil {
+		return errors.New("version is nil")
+	}
+
 	if f.MinClientVersion != "" {
-		r, err := version.Compare(f.MinClientVersion)
+		minClientVer := version.Parse(f.MinClientVersion)
+		r, err := version.CompareVersions(ver, minClientVer)
 		if err == nil && r < 0 {
 			err = fmt.Errorf("allowed minimum version: %s; please upgrade the client", f.MinClientVersion)
 		}
@@ -158,7 +170,8 @@ func (f *Format) CheckVersion() error {
 		}
 	}
 	if f.MaxClientVersion != "" {
-		r, err := version.Compare(f.MaxClientVersion)
+		maxClientVer := version.Parse(f.MaxClientVersion)
+		r, err := version.CompareVersions(ver, maxClientVer)
 		if err == nil && r > 0 {
 			err = fmt.Errorf("allowed maximum version: %s; please use an older client", f.MaxClientVersion)
 		}

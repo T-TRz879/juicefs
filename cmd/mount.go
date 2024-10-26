@@ -83,7 +83,7 @@ $ juicefs mount redis://localhost /mnt/jfs --backup-meta 0`,
 
 func exposeMetrics(c *cli.Context, registerer prometheus.Registerer, registry *prometheus.Registry) string {
 	var ip, port string
-	//default set
+	// default set
 	ip, port, err := net.SplitHostPort(c.String("metrics"))
 	if err != nil {
 		logger.Fatalf("metrics format error: %v", err)
@@ -137,14 +137,14 @@ func exposeMetrics(c *cli.Context, registerer prometheus.Registerer, registry *p
 }
 
 func wrapRegister(c *cli.Context, mp, name string) (prometheus.Registerer, *prometheus.Registry) {
-	commonLabels := prometheus.Labels{"mp": mp, "vol_name": name}
+	commonLabels := prometheus.Labels{"mp": mp, "vol_name": name, "juicefs_version": version.Version()}
 	if h, err := os.Hostname(); err == nil {
 		commonLabels["instance"] = h
 	} else {
 		logger.Warnf("cannot get hostname: %s", err)
 	}
 	if c.IsSet("custom-labels") {
-		for _, kv := range strings.Split(c.String("custom-labels"), ",") {
+		for _, kv := range strings.Split(c.String("custom-labels"), ";") {
 			splited := strings.Split(kv, ":")
 			if len(splited) != 2 {
 				logger.Fatalf("invalid label format: %s", kv)
@@ -176,15 +176,15 @@ func updateFormat(c *cli.Context) func(*meta.Format) {
 			format.StorageClass = c.String("storage-class")
 		}
 		if c.IsSet("upload-limit") {
-			format.UploadLimit = c.Int64("upload-limit")
+			format.UploadLimit = utils.ParseMbps(c, "upload-limit")
 		}
 		if c.IsSet("download-limit") {
-			format.DownloadLimit = c.Int64("download-limit")
+			format.DownloadLimit = utils.ParseMbps(c, "download-limit")
 		}
 	}
 }
 
-func daemonRun(c *cli.Context, addr string, vfsConf *vfs.Config) {
+func cacheDirPathToAbs(c *cli.Context) {
 	if runtime.GOOS != "windows" {
 		if cd := c.String("cache-dir"); cd != "memory" {
 			ds := utils.SplitDir(cd)
@@ -212,6 +212,22 @@ func daemonRun(c *cli.Context, addr string, vfsConf *vfs.Config) {
 			}
 		}
 	}
+
+	if rpAcLog := c.String("access-log"); rpAcLog != "" {
+		ap, err := filepath.Abs(rpAcLog)
+		if err == nil && ap != rpAcLog {
+			for i, a := range os.Args {
+				if a == rpAcLog || a == "--access-log="+rpAcLog {
+					os.Args[i] = a[:len(a)-len(rpAcLog)] + ap
+					break
+				}
+			}
+		}
+	}
+}
+
+func daemonRun(c *cli.Context, addr string, vfsConf *vfs.Config) {
+	cacheDirPathToAbs(c)
 	_ = expandPathForEmbedded(addr)
 	// The default log to syslog is only in daemon mode.
 	utils.InitLoggers(!c.Bool("no-syslog"))
@@ -250,7 +266,7 @@ func getVfsConf(c *cli.Context, metaConf *meta.Config, format *meta.Format, chun
 		Format:          *format,
 		Version:         version.Version(),
 		Chunk:           chunkConf,
-		BackupMeta:      duration(c.String("backup-meta")),
+		BackupMeta:      utils.Duration(c.String("backup-meta")),
 		BackupSkipTrash: c.Bool("backup-skip-trash"),
 		Port:            &vfs.Port{DebugAgent: debugAgent, PyroscopeAddr: c.String("pyroscope")},
 		PrefixInternal:  c.Bool("prefix-internal"),
@@ -288,13 +304,14 @@ func getMetaConf(c *cli.Context, mp string, readOnly bool) *meta.Config {
 	conf.SkipDirNlink = c.Int("skip-dir-nlink")
 	conf.ReadOnly = readOnly
 	conf.NoBGJob = c.Bool("no-bgjob")
-	conf.OpenCache = time.Duration(c.Float64("open-cache") * 1e9)
+	conf.OpenCache = utils.Duration(c.String("open-cache"))
 	conf.OpenCacheLimit = c.Uint64("open-cache-limit")
-	conf.Heartbeat = duration(c.String("heartbeat"))
+	conf.Heartbeat = utils.Duration(c.String("heartbeat"))
 	conf.MountPoint = mp
 	conf.Subdir = c.String("subdir")
-	conf.SkipDirMtime = duration(c.String("skip-dir-mtime"))
+	conf.SkipDirMtime = utils.Duration(c.String("skip-dir-mtime"))
 	conf.Sid, _ = strconv.ParseUint(os.Getenv("_JFS_META_SID"), 10, 64)
+	conf.SortDir = c.Bool("sort-dir")
 
 	atimeMode := c.String("atime-mode")
 	if atimeMode != meta.RelAtime && atimeMode != meta.StrictAtime && atimeMode != meta.NoAtime {
@@ -316,27 +333,30 @@ func getChunkConf(c *cli.Context, format *meta.Format) *chunk.Config {
 		Compress:   format.Compression,
 		HashPrefix: format.HashPrefix,
 
-		GetTimeout:    time.Second * time.Duration(c.Int("get-timeout")),
-		PutTimeout:    time.Second * time.Duration(c.Int("put-timeout")),
+		GetTimeout:    utils.Duration(c.String("get-timeout")),
+		PutTimeout:    utils.Duration(c.String("put-timeout")),
 		MaxUpload:     c.Int("max-uploads"),
+		MaxStageWrite: c.Int("max-stage-write"),
 		MaxRetries:    c.Int("io-retries"),
 		Writeback:     c.Bool("writeback"),
 		Prefetch:      c.Int("prefetch"),
-		BufferSize:    c.Int("buffer-size") << 20,
-		UploadLimit:   c.Int64("upload-limit") * 1e6 / 8,
-		DownloadLimit: c.Int64("download-limit") * 1e6 / 8,
-		UploadDelay:   duration(c.String("upload-delay")),
+		BufferSize:    utils.ParseBytes(c, "buffer-size", 'M'),
+		Readahead:     int(utils.ParseBytes(c, "max-readahead", 'M')),
+		UploadLimit:   utils.ParseMbps(c, "upload-limit") * 1e6 / 8,
+		DownloadLimit: utils.ParseMbps(c, "download-limit") * 1e6 / 8,
+		UploadDelay:   utils.Duration(c.String("upload-delay")),
 		UploadHours:   c.String("upload-hours"),
 
 		CacheDir:          c.String("cache-dir"),
-		CacheSize:         int64(c.Int("cache-size")),
+		CacheSize:         utils.ParseBytes(c, "cache-size", 'M'),
 		FreeSpace:         float32(c.Float64("free-space-ratio")),
 		CacheMode:         os.FileMode(cm),
 		CacheFullBlock:    !c.Bool("cache-partial-only"),
 		CacheChecksum:     c.String("verify-cache-checksum"),
 		CacheEviction:     c.String("cache-eviction"),
-		CacheScanInterval: duration(c.String("cache-scan-interval")),
-		CacheExpire:       duration(c.String("cache-expire")),
+		CacheScanInterval: utils.Duration(c.String("cache-scan-interval")),
+		CacheExpire:       utils.Duration(c.String("cache-expire")),
+		OSCache:           os.Getenv("JFS_DROP_OSCACHE") == "",
 		AutoCreate:        true,
 	}
 	if chunkConf.UploadLimit == 0 {
@@ -364,6 +384,8 @@ func initBackgroundTasks(c *cli.Context, vfsConf *vfs.Config, metaConf *meta.Con
 		registerer.MustRegister(vfs.LastBackupTimeG)
 		registerer.MustRegister(vfs.LastBackupDurationG)
 		go vfs.Backup(m, blob, vfsConf.BackupMeta, vfsConf.BackupSkipTrash)
+	} else {
+		logger.Warnf("Metadata backup is disabled")
 	}
 	if !c.Bool("no-usage-report") {
 		go usage.ReportUsage(m, version.Version())
@@ -373,6 +395,10 @@ func initBackgroundTasks(c *cli.Context, vfsConf *vfs.Config, metaConf *meta.Con
 type storageHolder struct {
 	object.ObjectStorage
 	fmt meta.Format
+}
+
+func (h *storageHolder) Shutdown() {
+	object.Shutdown(h.ObjectStorage)
 }
 
 func NewReloadableStorage(format *meta.Format, cli meta.Meta, patch func(*meta.Format)) (object.ObjectStorage, error) {
@@ -446,9 +472,15 @@ func insideContainer() bool {
 		return true
 	}
 	mountinfo, err := os.Open("/proc/1/mountinfo")
-	if os.IsNotExist(err) {
-		return false
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false
+		} else {
+			logger.Warnf("Open /proc/1/mountinfo: %s", err)
+			return false
+		}
 	}
+	defer mountinfo.Close()
 	scanner := bufio.NewScanner(mountinfo)
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -535,11 +567,17 @@ func mount(c *cli.Context) error {
 	removePassword(addr)
 	mp := c.Args().Get(1)
 
-	// __DAEMON_STAGE env is set by the godaemon.MakeDaemon function
+	stage := getDaemonStage()
+	if stage < 0 || stage > 2 {
+		logger.Fatalf("Invalid daemon stage: %d", stage)
+	}
 	supervisor := os.Getenv("JFS_SUPERVISOR")
-	inFirstProcess := supervisor == "test" || supervisor == "" && os.Getenv("__DAEMON_STAGE") == ""
-	if inFirstProcess {
-		var err error
+	if supervisor != "" || runtime.GOOS == "windows" {
+		stage = 3
+	}
+
+	var err error
+	if stage == 0 || supervisor == "test" {
 		err = utils.WithTimeout(func() error {
 			mp, err = filepath.Abs(mp)
 			return err
@@ -569,29 +607,43 @@ func mount(c *cli.Context) error {
 		}
 	}
 
+	var format = &meta.Format{}
+	var metaCli meta.Meta
+	var blob object.ObjectStorage
 	metaConf := getMetaConf(c, mp, c.Bool("read-only") || utils.StringContains(strings.Split(c.String("o"), ","), "ro"))
 	metaConf.CaseInsensi = strings.HasSuffix(mp, ":") && runtime.GOOS == "windows"
-	metaCli := meta.NewClient(addr, metaConf)
-	format, err := metaCli.Load(true)
-	if err != nil {
-		return err
+	// stage 0: check the connection to fail fast
+	// stage 2: need the volume name to check if it's already mounted
+	// stage 3: the real service process
+	if stage != 1 {
+		metaCli = meta.NewClient(addr, metaConf)
+		format, err = metaCli.Load(true)
+		if err != nil {
+			return err
+		}
 	}
 
 	chunkConf := getChunkConf(c, format)
 	vfsConf := getVfsConf(c, metaConf, format, chunkConf)
 	setFuseOption(c, format, vfsConf)
+	if stage == 0 || stage == 3 {
+		blob, err = NewReloadableStorage(format, metaCli, updateFormat(c))
+		if err != nil {
+			return fmt.Errorf("object storage: %s", err)
+		}
+		logger.Infof("Data use %s", blob)
 
-	// should create object storage before launchMount
-	blob, err := NewReloadableStorage(format, metaCli, updateFormat(c))
-	if err != nil {
-		return fmt.Errorf("object storage: %s", err)
 	}
-	logger.Infof("Data use %s", blob)
 
-	if os.Getenv("JFS_SUPERVISOR") == "" {
-		// close the database connection that is not in the final stage
-		if err = metaCli.Shutdown(); err != nil {
-			logger.Errorf("[pid=%d] meta shutdown: %s", os.Getpid(), err)
+	if stage < 3 {
+		// supervisor serves no user request
+		if metaCli != nil {
+			if err = metaCli.Shutdown(); err != nil {
+				logger.Errorf("[pid=%d] meta shutdown: %s", os.Getpid(), err)
+			}
+		}
+		if blob != nil {
+			object.Shutdown(blob)
 		}
 		var foreground bool
 		if runtime.GOOS == "windows" || !c.Bool("background") || os.Getenv("JFS_FOREGROUND") != "" {
@@ -604,7 +656,7 @@ func mount(c *cli.Context) error {
 		if foreground {
 			go checkMountpoint(format.Name, mp, c.String("log"), false)
 		} else {
-			daemonRun(c, addr, vfsConf)
+			daemonRun(c, addr, vfsConf) // only stage 0 needs the vfsConf
 		}
 		os.Setenv("JFS_SUPERVISOR", strconv.Itoa(os.Getppid()))
 		return launchMount(mp, vfsConf)
@@ -635,7 +687,7 @@ func mount(c *cli.Context) error {
 		store.UpdateLimit(fmt.UploadLimit, fmt.DownloadLimit)
 	})
 	v := vfs.NewVFS(vfsConf, metaCli, store, registerer, registry)
-	installHandler(mp, v)
+	installHandler(mp, v, blob)
 	v.UpdateFormat = updateFormat(c)
 	initBackgroundTasks(c, vfsConf, metaConf, metaCli, blob, registerer, registry)
 	mountMain(v, c)
@@ -643,6 +695,7 @@ func mount(c *cli.Context) error {
 		logger.Errorf("flush all delayed data: %s", err)
 	}
 	err = metaCli.CloseSession()
+	object.Shutdown(blob)
 	logger.Infof("The juicefs mount process exit successfully, mountpoint: %s", metaConf.MountPoint)
 	return err
 }

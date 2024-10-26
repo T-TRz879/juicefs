@@ -10,6 +10,7 @@
 	<packaging>jar</packaging>
 	<properties>
 		<hadoop.version>3.1.4</hadoop.version>
+		<flink.version>1.16.3</flink.version>
 		<argLine>-Djdk.net.URLClassPath.disableClassPathURLCheck=true -Djava.library.path=${project.basedir}/../mount/libjfs:${java.library.path} -Djdk.attach.allowAttachSelf=true</argLine>
 	</properties>
 
@@ -207,6 +208,29 @@
 					</avoidCallsTo>
 				</configuration>
 			</plugin>
+			<plugin>
+				<groupId>io.github.git-commit-id</groupId>
+				<artifactId>git-commit-id-maven-plugin</artifactId>
+				<version>4.9.9</version>
+				<executions>
+					<execution>
+						<id>get-the-git-infos</id>
+						<goals>
+							<goal>revision</goal>
+						</goals>
+						<phase>initialize</phase>
+					</execution>
+				</executions>
+				<configuration>
+					<generateGitPropertiesFile>true</generateGitPropertiesFile>
+					<generateGitPropertiesFilename>${project.build.outputDirectory}/juicefs-ver.properties</generateGitPropertiesFilename>
+					<includeOnlyProperties>
+						<includeOnlyProperty>^git.build.(time|version)$</includeOnlyProperty>
+						<includeOnlyProperty>^git.commit.id.(abbrev|full)$</includeOnlyProperty>
+					</includeOnlyProperties>
+					<commitIdGenerationMode>full</commitIdGenerationMode>
+				</configuration>
+			</plugin>
 		</plugins>
 		<resources>
 			<resource>
@@ -288,13 +312,13 @@
 		<dependency>
 			<groupId>org.apache.flink</groupId>
 			<artifactId>flink-hadoop-fs</artifactId>
-			<version>1.10.3</version>
+			<version>${flink.version}</version>
 			<scope>provided</scope>
 		</dependency>
 		<dependency>
 			<groupId>org.apache.flink</groupId>
 			<artifactId>flink-core</artifactId>
-			<version>1.10.3</version>
+			<version>${flink.version}</version>
 			<scope>provided</scope>
 		</dependency>
 		<dependency>
@@ -310,8 +334,8 @@
 		</dependency>
 		<dependency>
 			<groupId>org.apache.flink</groupId>
-			<artifactId>flink-streaming-java_2.12</artifactId>
-			<version>1.10.0</version>
+			<artifactId>flink-streaming-java</artifactId>
+			<version>${flink.version}</version>
 			<scope>test</scope>
 		</dependency>
 		<dependency>

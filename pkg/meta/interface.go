@@ -24,7 +24,6 @@ import (
 	"os"
 	"strconv"
 	"strings"
-	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -305,34 +304,6 @@ type Session struct {
 	Plocks    []Plock `json:",omitempty"`
 }
 
-type Quota struct {
-	MaxSpace, MaxInodes   int64
-	UsedSpace, UsedInodes int64
-	newSpace, newInodes   int64
-}
-
-// Returns true if it will exceed the quota limit
-func (q *Quota) check(space, inodes int64) bool {
-	if space > 0 {
-		max := atomic.LoadInt64(&q.MaxSpace)
-		if max > 0 && atomic.LoadInt64(&q.UsedSpace)+atomic.LoadInt64(&q.newSpace)+space > max {
-			return true
-		}
-	}
-	if inodes > 0 {
-		max := atomic.LoadInt64(&q.MaxInodes)
-		if max > 0 && atomic.LoadInt64(&q.UsedInodes)+atomic.LoadInt64(&q.newInodes)+inodes > max {
-			return true
-		}
-	}
-	return false
-}
-
-func (q *Quota) update(space, inodes int64) {
-	atomic.AddInt64(&q.newSpace, space)
-	atomic.AddInt64(&q.newInodes, inodes)
-}
-
 // Meta is a interface for a meta service for file system.
 type Meta interface {
 	// Name of database
@@ -405,6 +376,8 @@ type Meta interface {
 	Link(ctx Context, inodeSrc, parent Ino, name string, attr *Attr) syscall.Errno
 	// Readdir returns all entries for given directory, which include attributes if plus is true.
 	Readdir(ctx Context, inode Ino, wantattr uint8, entries *[]*Entry) syscall.Errno
+	// NewDirHandler returns a stream for directory entries.
+	NewDirHandler(ctx Context, inode Ino, plus bool, initEntries []*Entry) (DirHandler, syscall.Errno)
 	// Create creates a file in a directory with given name.
 	Create(ctx Context, parent Ino, name string, mode uint16, cumask uint16, flags uint32, inode *Ino, attr *Attr) syscall.Errno
 	// Open checks permission on a node and track it as open.
@@ -447,7 +420,7 @@ type Meta interface {
 	Compact(ctx Context, inode Ino, concurrency int, preFunc, postFunc func()) syscall.Errno
 
 	// ListSlices returns all slices used by all files.
-	ListSlices(ctx Context, slices map[Ino][]Slice, delete bool, showProgress func()) syscall.Errno
+	ListSlices(ctx Context, slices map[Ino][]Slice, scanPending, delete bool, showProgress func()) syscall.Errno
 	// Remove all files and directories recursively.
 	// count represents the number of attempted deletions of entries (even if failed).
 	Remove(ctx Context, parent Ino, name string, count *uint64) syscall.Errno
@@ -456,7 +429,7 @@ type Meta interface {
 	// GetTreeSummary returns a summary in tree structure
 	GetTreeSummary(ctx Context, root *TreeSummary, depth, topN uint8, strict bool, updateProgress func(count uint64, bytes uint64)) syscall.Errno
 	// Clone a file or directory
-	Clone(ctx Context, srcIno, dstParentIno Ino, dstName string, cmode uint8, cumask uint16, count, total *uint64) syscall.Errno
+	Clone(ctx Context, srcParentIno, srcIno, dstParentIno Ino, dstName string, cmode uint8, cumask uint16, count, total *uint64) syscall.Errno
 	// GetPaths returns all paths of an inode
 	GetPaths(ctx Context, inode Ino) []string
 	// Check integrity of an absolute path and repair it if asked
@@ -473,10 +446,10 @@ type Meta interface {
 	// OnReload register a callback for any change founded after reloaded.
 	OnReload(func(new *Format))
 
-	HandleQuota(ctx Context, cmd uint8, dpath string, quotas map[string]*Quota, strict, repair bool) error
+	HandleQuota(ctx Context, cmd uint8, dpath string, quotas map[string]*Quota, strict, repair bool, create bool) error
 
 	// Dump the tree under root, which may be modified by checkRoot
-	DumpMeta(w io.Writer, root Ino, keepSecret, fast, skipTrash bool) error
+	DumpMeta(w io.Writer, root Ino, threads int, keepSecret, fast, skipTrash bool) error
 	LoadMeta(r io.Reader) error
 
 	// getBase return the base engine.

@@ -31,6 +31,7 @@ import org.apache.hadoop.security.UserGroupInformation;
 import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.io.OutputStream;
+import java.lang.reflect.Method;
 import java.net.InetAddress;
 import java.net.URI;
 import java.nio.ByteBuffer;
@@ -450,6 +451,20 @@ public class JuiceFileSystemTest extends TestCase {
      */
   }
 
+  public void testInputStreamSkipNBytes() throws Exception {
+    Path f = new Path("/test-skipnbytes");
+    try (FSDataOutputStream out = fs.create(f)) {
+      out.writeBytes("hello juicefs");
+    }
+    Class<JuiceFileSystemImpl.FileInputStream> inputStreamClass = JuiceFileSystemImpl.FileInputStream.class;
+    Method skipNBytes = inputStreamClass.getMethod("skipNBytes", long.class);
+    try (FSDataInputStream in = fs.open(f)) {
+      skipNBytes.invoke(in.getWrappedStream(), 6);
+      String s = IOUtils.toString(in);
+      assertEquals("juicefs", s);
+    }
+  }
+
   public void testReadStats() throws IOException {
     FileSystem.Statistics statistics = FileSystem.getStatistics(fs.getScheme(),
             ((FilterFileSystem) fs).getRawFileSystem().getClass());
@@ -747,6 +762,29 @@ public class JuiceFileSystemTest extends TestCase {
     ou.close();
     FileSystem newFS = FileSystem.newInstance(newConf);
     assertEquals("10000", fooFs.getFileStatus(f).getOwner());
+
+    fooFs.delete(f, false);
+  }
+
+  public void testGuidMappingFromString() throws Exception {
+    Configuration newConf = new Configuration(cfg);
+
+    newConf.set("juicefs.users", "bar:10000;foo:20000;baz:30000");
+    newConf.set("juicefs.groups", "user:1000:foo,bar;admin:2000:baz");
+    newConf.set("juicefs.superuser", UserGroupInformation.getCurrentUser().getShortUserName());
+
+    FileSystem fooFs = createNewFs(newConf, "foo", new String[]{"nogrp"});
+    Path f = new Path("/test_foo");
+    fooFs.create(f).close();
+    fooFs.setOwner(f, "foo", "user");
+    assertEquals("foo", fooFs.getFileStatus(f).getOwner());
+    assertEquals("user", fooFs.getFileStatus(f).getGroup());
+
+    newConf.set("juicefs.users", "foo:20001");
+    newConf.set("juicefs.groups", "user:1001:foo,bar;admin:2001:baz");
+    FileSystem newFS = FileSystem.newInstance(newConf);
+    assertEquals("20000", fooFs.getFileStatus(f).getOwner());
+    assertEquals("1000", fooFs.getFileStatus(f).getGroup());
 
     fooFs.delete(f, false);
   }
@@ -1119,5 +1157,37 @@ public class JuiceFileSystemTest extends TestCase {
     FileStatus[] fileStatuses = fs.listStatus(p);
     assertTrue(fileStatuses[0].getPermission().getAclBit());
     assertTrue(fileStatuses[0].hasAcl());
+  }
+
+  public void testRenameAccessControlException() throws Exception {
+    Path d1 = new Path("/renameAccessControlExceptionDir1");
+    Path d2 = new Path("/renameAccessControlExceptionDir2");
+    Path p = new Path(d1, "file");
+    FileSystem user1Fs = createNewFs(cfg, "user1", new String[]{"group1"});
+
+    user1Fs.mkdirs(d1);
+    user1Fs.mkdirs(d2);
+    user1Fs.create(p).close();
+    user1Fs.setPermission(d1, new FsPermission((short) 0000));
+    user1Fs.setPermission(d2, new FsPermission((short) 0777));
+    try {
+      user1Fs.rename(p, d2);
+    } catch (AccessControlException e) {
+      assertTrue(e.getMessage().contains("renameAccessControlExceptionDir1"));
+    }
+
+    user1Fs.setPermission(d1, new FsPermission((short) 0777));
+    user1Fs.setPermission(d2, new FsPermission((short) 000));
+    try {
+      user1Fs.rename(p, d2);
+    } catch (AccessControlException e) {
+      assertTrue(e.getMessage().contains("renameAccessControlExceptionDir2"));
+    }
+
+    // clean
+    user1Fs.setPermission(d1, new FsPermission((short) 0777));
+    user1Fs.setPermission(d2, new FsPermission((short) 0777));
+    user1Fs.delete(d1, true);
+    user1Fs.delete(d2, true);
   }
 }

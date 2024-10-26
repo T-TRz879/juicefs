@@ -17,6 +17,7 @@
 package utils
 
 import (
+	"crypto/rand"
 	"fmt"
 	"mime"
 	"net"
@@ -113,7 +114,7 @@ func WithTimeout(f func() error, timeout time.Duration) error {
 	case <-done:
 		t.Stop()
 	case <-t.C:
-		err = fmt.Errorf("timeout after %s", timeout)
+		err = fmt.Errorf("timeout after %s: %w", timeout, ErrFuncTimeout)
 	}
 	return err
 }
@@ -166,6 +167,12 @@ func FormatBytes(n uint64) string {
 
 func SupportANSIColor(fd uintptr) bool {
 	return isatty.IsTerminal(fd) && runtime.GOOS != "windows"
+}
+
+func RandRead(buf []byte) {
+	if _, err := rand.Read(buf); err != nil {
+		logger.Fatalf("Generate random content: %s", err)
+	}
 }
 
 var uids = make(map[int]string)
@@ -246,4 +253,30 @@ func LookupGroup(name string) int {
 	}
 	groups[name] = gid
 	return gid
+}
+
+func Duration(s string) time.Duration {
+	if s == "" {
+		return 0
+	}
+	v, err := strconv.ParseFloat(s, 64)
+	if err == nil {
+		return time.Microsecond * time.Duration(v*1e6)
+	}
+
+	err = nil
+	var d time.Duration
+	p := strings.Index(s, "d")
+	if p >= 0 {
+		v, err = strconv.ParseFloat(s[:p], 64)
+	}
+	if err == nil && s[p+1:] != "" {
+		d, err = time.ParseDuration(s[p+1:])
+	}
+
+	if err != nil {
+		logger.Warnf("Invalid duration value: %s, setting it to 0", s)
+		return 0
+	}
+	return d + time.Hour*time.Duration(v*24)
 }

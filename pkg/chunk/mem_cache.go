@@ -40,7 +40,7 @@ type memcache struct {
 
 func newMemStore(config *Config, metrics *cacheManagerMetrics) *memcache {
 	c := &memcache{
-		capacity: config.CacheSize << 20,
+		capacity: int64(config.CacheSize),
 		pages:    make(map[string]memItem),
 		eviction: config.CacheEviction,
 		metrics:  metrics,
@@ -70,7 +70,7 @@ func (c *memcache) stats() (int64, int64) {
 	return int64(len(c.pages)), c.used
 }
 
-func (c *memcache) cache(key string, p *Page, force bool) {
+func (c *memcache) cache(key string, p *Page, force, dropCache bool) {
 	if c.capacity == 0 {
 		return
 	}
@@ -102,7 +102,7 @@ func (c *memcache) delete(key string, p *Page) {
 	delete(c.pages, key)
 }
 
-func (c *memcache) remove(key string) {
+func (c *memcache) remove(key string, staging bool) {
 	c.Lock()
 	defer c.Unlock()
 	if item, ok := c.pages[key]; ok {
@@ -149,5 +149,7 @@ func (c *memcache) cleanup() {
 func (c *memcache) stage(key string, data []byte, keepCache bool) (string, error) {
 	return "", errors.New("not supported")
 }
-func (c *memcache) uploaded(key string, size int) {}
-func (c *memcache) stagePath(key string) string   { return "" }
+func (c *memcache) uploaded(key string, size int)    {}
+func (c *memcache) stagePath(key string) string      { return "" }
+func (c *memcache) isEmpty() bool                    { return false }
+func (c *memcache) getMetrics() *cacheManagerMetrics { return c.metrics }

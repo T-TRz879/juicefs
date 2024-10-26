@@ -17,15 +17,16 @@
 package chunk
 
 import (
-	"crypto/rand"
 	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
+	"github.com/juicedata/juicefs/pkg/utils"
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
+	"github.com/stretchr/testify/require"
 )
 
 // Copy from https://github.com/prometheus/client_golang/blob/v1.14.0/prometheus/testutil/testutil.go
@@ -81,7 +82,7 @@ func TestMetrics(t *testing.T) {
 	s := m.(*cacheManager).stores[0]
 	content := []byte("helloworld")
 	p := NewPage(content)
-	s.cache("test", p, true)
+	s.cache("test", p, true, false)
 	// Waiting for the cache to be flushed
 	time.Sleep(time.Millisecond * 100)
 	if toFloat64(metrics.cacheWrites) != 1.0 {
@@ -139,14 +140,14 @@ func TestChecksum(t *testing.T) {
 	k5 := "4_8_1048576"
 
 	p := NewPage([]byte("helloworld"))
-	s.cache(k1, p, true)
+	s.cache(k1, p, true, false)
 
 	s.checksum = CsFull
-	s.cache(k2, p, true)
+	s.cache(k2, p, true, false)
 
 	buf := make([]byte, 102400)
-	_, _ = rand.Read(buf)
-	s.cache(k3, NewPage(buf), true)
+	utils.RandRead(buf)
+	s.cache(k3, NewPage(buf), true, false)
 
 	fpath := s.cachePath(k4)
 	f, err := os.OpenFile(fpath, os.O_WRONLY|os.O_CREATE, s.mode)
@@ -170,8 +171,8 @@ func TestChecksum(t *testing.T) {
 	s.add(k4, 102400, uint32(time.Now().Unix()))
 
 	buf = make([]byte, 1048576)
-	_, _ = rand.Read(buf)
-	s.cache(k5, NewPage(buf), true)
+	utils.RandRead(buf)
+	s.cache(k5, NewPage(buf), true, false)
 	time.Sleep(time.Second * 5) // wait for cache file flushed
 
 	check := func(key string, off int64, size int) error {
@@ -244,7 +245,7 @@ func BenchmarkLoadCached(b *testing.B) {
 	s := newCacheStore(nil, filepath.Join(dir, "diskCache"), 1<<30, 1, &defaultConf, nil)
 	p := NewPage(make([]byte, 1024))
 	key := "/chunks/1_1024"
-	s.cache(key, p, false)
+	s.cache(key, p, false, false)
 	time.Sleep(time.Millisecond * 100)
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
@@ -290,10 +291,67 @@ func TestCheckPath(t *testing.T) {
 		{path: "chunks/111_/2222/3333_3333_3333", expected: false},
 		{path: "chunks/111/22_22/3333_3333_3333", expected: false},
 		{path: "chunks/111/22_22/3333_3333_3333", expected: false},
+		{path: "chunks/dd/222/3333_3333_0", expected: true}, // hash prefix
+		{path: "chunks/FF/222/3333_3333_0", expected: true}, // hash prefix
+		{path: "chunks/5D/222/3333_3333_0", expected: true}, // hash prefix
+		{path: "chunks/D1/222/3333_3333_0", expected: true}, // hash prefix
+		{path: "chunks/5DD/222/3333_3333_0", expected: false},
+		{path: "chunks/111D/222/3333_3333_0", expected: false},
 	}
 	for _, c := range cases {
 		if res := pathReg.MatchString(c.path); res != c.expected {
 			t.Fatalf("check path %s expected %v but got %v", c.path, c.expected, res)
 		}
 	}
+}
+
+func shutdownStore(s *cacheStore) {
+	s.stateLock.Lock()
+	defer s.stateLock.Unlock()
+	s.state.stop()
+	s.state = newDCState(dcDown, s)
+}
+
+func TestCacheManager(t *testing.T) {
+	conf := defaultConf
+	conf.CacheDir = "/tmp/diskCache0:/tmp/diskCache1:/tmp/diskCache2"
+	conf.AutoCreate = true
+	defer os.RemoveAll("/tmp/diskCache0")
+	defer os.RemoveAll("/tmp/diskCache1")
+	defer os.RemoveAll("/tmp/diskCache2")
+	manager := newCacheManager(&conf, nil, nil)
+	require.True(t, !manager.isEmpty())
+
+	m, ok := manager.(*cacheManager)
+	require.True(t, ok)
+	require.Equal(t, 3, m.length())
+
+	// case: key rehash after store removal
+	k1 := "k1"
+	p1 := NewPage([]byte{1, 2, 3})
+	defer p1.Release()
+	m.cache(k1, p1, true, false)
+
+	s1 := m.getStore(k1)
+	require.NotNil(t, s1)
+
+	m.Lock()
+	shutdownStore(s1)
+	m.Unlock()
+	time.Sleep(3 * time.Second)
+
+	rc, _ := m.load(k1)
+	require.Nil(t, rc)
+
+	s2 := m.getStore(k1)
+	require.NotNil(t, s2)
+
+	// case: remove all store
+	m.Lock()
+	for _, s := range m.storeMap {
+		shutdownStore(s)
+	}
+	m.Unlock()
+	time.Sleep(3 * time.Second)
+	require.True(t, m.isEmpty())
 }

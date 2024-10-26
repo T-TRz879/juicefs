@@ -18,10 +18,10 @@ package cmd
 
 import (
 	"fmt"
-	"sort"
-
 	"github.com/dustin/go-humanize"
 	"github.com/juicedata/juicefs/pkg/meta"
+	"github.com/juicedata/juicefs/pkg/utils"
+	"sort"
 
 	"github.com/urfave/cli/v2"
 )
@@ -78,7 +78,11 @@ $ juicefs quota delete redis://localhost --path /dir1`,
 				Name:  "path",
 				Usage: "full path of the directory within the volume",
 			},
-			&cli.Uint64Flag{
+			&cli.BoolFlag{
+				Name:  "create",
+				Usage: "create the directory if not exists",
+			},
+			&cli.StringFlag{
 				Name:  "capacity",
 				Usage: "hard quota of the directory limiting its usage of space in GiB",
 			},
@@ -132,7 +136,7 @@ func quota(c *cli.Context) error {
 		strict = c.Bool("strict")
 		q := &meta.Quota{MaxSpace: -1, MaxInodes: -1} // negative means no change
 		if c.IsSet("capacity") {
-			q.MaxSpace = int64(c.Uint64("capacity")) << 30
+			q.MaxSpace = int64(utils.ParseBytes(c, "capacity", 'G'))
 		}
 		if c.IsSet("inodes") {
 			q.MaxInodes = int64(c.Uint64("inodes"))
@@ -143,7 +147,7 @@ func quota(c *cli.Context) error {
 		strict = c.Bool("strict")
 		repair = c.Bool("repair")
 	}
-	if err := m.HandleQuota(meta.Background, cmd, dpath, qs, strict, repair); err != nil {
+	if err := m.HandleQuota(meta.Background, cmd, dpath, qs, strict, repair, c.Bool("create")); err != nil {
 		return err
 	} else if len(qs) == 0 {
 		return nil
