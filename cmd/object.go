@@ -117,6 +117,9 @@ var bufPool = sync.Pool{
 }
 
 func (j *juiceFS) Put(key string, in io.Reader, getters ...object.AttrGetter) (err error) {
+	if vfs.IsSpecialName(key) {
+		return fmt.Errorf("skip special file %s for jfs: %w", key, utils.ErrSkipped)
+	}
 	p := j.path(key)
 	if strings.HasSuffix(p, "/") {
 		eno := j.jfs.MkdirAll(ctx, p, 0777, j.umask)
@@ -214,9 +217,9 @@ func (j *juiceFS) Head(key string) (object.Object, error) {
 	return &jObj{key, fi}, nil
 }
 
-func (j *juiceFS) List(prefix, marker, delimiter string, limit int64, followLink bool) ([]object.Object, error) {
+func (j *juiceFS) List(prefix, marker, token, delimiter string, limit int64, followLink bool) ([]object.Object, bool, string, error) {
 	if delimiter != "/" {
-		return nil, utils.ENOTSUP
+		return nil, false, "", utils.ENOTSUP
 	}
 	dir := j.path(prefix)
 	var objs []object.Object
@@ -229,18 +232,18 @@ func (j *juiceFS) List(prefix, marker, delimiter string, limit int64, followLink
 		obj, err := j.Head(prefix)
 		if err != nil {
 			if os.IsNotExist(err) {
-				return nil, nil
+				return nil, false, "", nil
 			}
-			return nil, err
+			return nil, false, "", err
 		}
 		objs = append(objs, obj)
 	}
 	entries, err := j.readDirSorted(dir, followLink)
 	if err != 0 {
 		if err == syscall.ENOENT {
-			return nil, nil
+			return nil, false, "", nil
 		}
-		return nil, err
+		return nil, false, "", err
 	}
 	for _, e := range entries {
 		key := dir[1:] + e.name
@@ -253,7 +256,11 @@ func (j *juiceFS) List(prefix, marker, delimiter string, limit int64, followLink
 			break
 		}
 	}
-	return objs, nil
+	var nextMarker string
+	if len(objs) > 0 {
+		nextMarker = objs[len(objs)-1].Key()
+	}
+	return objs, len(objs) == int(limit), nextMarker, nil
 }
 
 type mEntry struct {

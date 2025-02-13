@@ -30,6 +30,10 @@ func mountFlags() []cli.Flag {
 			Name:  "o",
 			Usage: "other FUSE options",
 		},
+		&cli.StringFlag{
+			Name:  "access-log",
+			Usage: "Access log file",
+		},
 		&cli.BoolFlag{
 			Name:  "as-root",
 			Usage: "Access files as administrator",
@@ -61,6 +65,7 @@ func getDaemonStage() int {
 }
 
 func mountMain(v *vfs.VFS, c *cli.Context) {
+	v.Conf.AccessLog = c.String("access-log")
 	winfsp.Serve(v, c.String("o"), c.Float64("file-cache-to"), c.Bool("as-root"), c.Int("delay-close"))
 }
 
@@ -72,4 +77,4 @@ func setFuseOption(c *cli.Context, format *meta.Format, vfsConf *vfs.Config) {}
 
 func launchMount(mp string, conf *vfs.Config) error { return nil }
 
-func installHandler(mp string, v *vfs.VFS, blob object.ObjectStorage) {}
+func installHandler(m meta.Meta, mp string, v *vfs.VFS, blob object.ObjectStorage) {}

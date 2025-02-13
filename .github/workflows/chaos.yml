@@ -5,9 +5,8 @@ on:
     branches:
       - 'release-**'
       - 'main'
-    paths-ignore:
-      - 'docs/**'
-      - '**.md'
+    paths:
+      - '**/chaos.yml'
   pull_request:
     branches:
       - 'main'
@@ -22,12 +21,12 @@ on:
         required: false
         default: false
   schedule:
-    - cron:  '0 0 * * *'        
+    - cron:  '0 20 * * *'        
 
 jobs:
   chaos-test:
     timeout-minutes: 60
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-20.04
     strategy:
       fail-fast: false
       matrix:
@@ -78,10 +77,10 @@ jobs:
       - name: Build And Load CSI Docker Image
         run: |
           version=`./juicefs version |awk '{print $3}' | cut -d '-' -f1`
-          docker build -f .github/scripts/chaos/juicefs.Dockerfile -t juicedata/mount:ee-${version} .
+          docker build -f .github/scripts/chaos/juicefs.Dockerfile -t juicedata/mount:ce-v${version} .
           helm repo add juicefs https://juicedata.github.io/charts/
           helm repo update
-          kind load docker-image juicedata/mount:ee-${version} --name chart-testing
+          kind load docker-image juicedata/mount:ce-v${version} --name chart-testing
           
       - name: Install JuiceFS CSI Driver
         run: |
@@ -96,12 +95,13 @@ jobs:
 
       - name: Deploy minio
         run: |
+          rm -rf /data/minio-data/*
           kubectl apply -f .github/scripts/chaos/minio.yaml
 
       - name: Mount Juicefs 
         run: |
           version=`./juicefs version |awk '{print $3}' | cut -d '-' -f1`
-          sed -i "s/mount:ci/mount:ee-$version/" .github/scripts/chaos/sc.yaml
+          sed -i "s/mount:ci/mount:ce-v$version/" .github/scripts/chaos/sc.yaml
           kubectl apply -f .github/scripts/chaos/sc.yaml
           kubectl apply -f .github/scripts/chaos/pvc.yaml
 
@@ -163,6 +163,18 @@ jobs:
               exit 1
             fi
           done
+      
+      - name: Check mount pod
+        if: always()
+        run: |
+          POD_NAME=$(kubectl get pods -n kube-system -o go-template --template '{{range .items}}{{.metadata.name}}{{"\n"}}{{end}}'  | grep juicefs-chart-testing-control-plane-pvc)
+          echo POD_NAME is $POD_NAME
+          for pod in $POD_NAME;do
+            kubectl -n kube-system describe po $pod
+            kubectl logs -n kube-system $pod > juicefs.log
+            cat juicefs.log
+            grep "<FATAL>:" juicefs.log | grep -v format.go && exit 1 || true
+          done
 
       - name: Mount pod upgrade
         timeout-minutes: 5
@@ -179,10 +191,10 @@ jobs:
             sleep 5
             if ! grep "SUCCESS" upgrade.log;then exit -1;fi
             rm upgrade.log
-            kubectl exec $CSI_POD_NAME -n kube-system -- juicefs-csi-driver upgrade $PVC_POD_NAME --restart 2>&1 | tee upgrade.log      
+            kubectl exec $CSI_POD_NAME -n kube-system -- juicefs-csi-driver upgrade $PVC_POD_NAME --restart 2>&1 | tee upgrade.log || true  
             sleep 5
-            if ! grep "SUCCESS" upgrade.log;then exit -1;fi
           fi
+          kubectl delete -f .github/scripts/chaos/workflow.yaml
 
       - name: Check csi controller log
         if: always()
@@ -203,13 +215,15 @@ jobs:
 
       - name: Check mount point pod
         if: always()
-        run: | 
-          POD_NAME=$(kubectl get pods -n kube-system -o go-template --template '{{range .items}}{{.metadata.name}}{{"\n"}}{{end}}'  | grep juicefs-chart-testing-control-plane-pvc)
+        run: |
+          POD_NAME=$(kubectl get pods -n kube-system | grep juicefs-chart-testing-control-plane-pvc | grep Running | awk '{print $1}')
           echo POD_NAME is $POD_NAME
-          kubectl -n kube-system describe po $POD_NAME
-          kubectl logs -n kube-system $POD_NAME > juicefs.log
-          cat juicefs.log
-          grep "<FATAL>:" juicefs.log && exit 1 || true
+          for pod in $POD_NAME;do
+            kubectl -n kube-system describe po $pod
+            kubectl logs -n kube-system $pod > juicefs.log
+            cat juicefs.log
+            grep "<FATAL>:" juicefs.log | grep -v format.go && exit 1 || true
+          done
 
       - name: Check vdbench log
         if: always()

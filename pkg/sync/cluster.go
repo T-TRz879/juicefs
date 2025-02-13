@@ -190,19 +190,9 @@ func startManager(config *Config, tasks <-chan object.Object) (string, error) {
 	if config.ManagerAddr != "" {
 		addr = config.ManagerAddr
 	} else {
-		ips, err := utils.FindLocalIPs()
+		ip, err := utils.GetLocalIp(net.JoinHostPort(config.Workers[0], "22"))
 		if err != nil {
-			return "", fmt.Errorf("find local ips: %s", err)
-		}
-		var ip string
-		for _, i := range ips {
-			if i = i.To4(); i != nil {
-				ip = i.String()
-				break
-			}
-		}
-		if ip == "" {
-			return "", fmt.Errorf("no local ip found")
+			return "", fmt.Errorf("not found local ip: %s", err)
 		}
 		addr = ip
 	}
@@ -306,17 +296,20 @@ func launchWorker(address string, config *Config, wg *sync.WaitGroup) {
 				return
 			}
 			logger.Infof("launch a worker on %s", host)
+			var finished = make(chan struct{})
 			go func() {
 				r := bufio.NewReader(stderr)
 				for {
 					line, err := r.ReadString('\n')
 					if err != nil || len(line) == 0 {
+						finished <- struct{}{}
 						return
 					}
 					println(host, line[:len(line)-1])
 				}
 			}()
 			err = cmd.Wait()
+			<-finished
 			if err != nil {
 				logger.Errorf("%s: %s", host, err)
 			}
@@ -327,7 +320,16 @@ func launchWorker(address string, config *Config, wg *sync.WaitGroup) {
 func marshalObjects(objs []object.Object) ([]byte, error) {
 	var arr []map[string]interface{}
 	for _, o := range objs {
-		arr = append(arr, object.MarshalObject(o))
+		obj := object.MarshalObject(o)
+		switch oo := o.(type) {
+		case *withSize:
+			obj["nsize"] = oo.nsize
+			obj["size"] = oo.Object.Size()
+		case *withFSize:
+			obj["fnsize"] = oo.nsize
+			obj["size"] = oo.File.Size()
+		}
+		arr = append(arr, obj)
 	}
 	return json.MarshalIndent(arr, "", " ")
 }
@@ -340,7 +342,13 @@ func unmarshalObjects(d []byte) ([]object.Object, error) {
 	}
 	var objs []object.Object
 	for _, m := range arr {
-		objs = append(objs, object.UnmarshalObject(m))
+		obj := object.UnmarshalObject(m)
+		if nsize, ok := m["nsize"]; ok {
+			obj = &withSize{obj, int64(nsize.(float64))}
+		} else if fnsize, ok := m["fnsize"]; ok {
+			obj = &withFSize{obj.(object.File), int64(fnsize.(float64))}
+		}
+		objs = append(objs, obj)
 	}
 	return objs, nil
 }

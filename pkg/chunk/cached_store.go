@@ -127,7 +127,7 @@ func (s *rSlice) ReadAt(ctx context.Context, page *Page, off int) (n int, err er
 	}
 
 	key := s.key(indx)
-	if s.store.conf.CacheSize > 0 {
+	if s.store.conf.CacheEnabled() {
 		start := time.Now()
 		r, err := s.store.bcache.load(key)
 		if err == nil {
@@ -142,10 +142,8 @@ func (s *rSlice) ReadAt(ctx context.Context, page *Page, off int) (n int, err er
 				s.store.cacheReadHist.Observe(time.Since(start).Seconds())
 				return n, nil
 			}
-			if f, ok := r.(*os.File); ok {
-				logger.Warnf("remove partial cached block %s: %d %s", f.Name(), n, err)
-				_ = os.Remove(f.Name())
-			}
+			logger.Warnf("remove partial cached block %s: %d %s", key, n, err)
+			s.store.bcache.remove(key, false)
 		}
 	}
 
@@ -391,7 +389,7 @@ func (store *cachedStore) upload(key string, block *Page, s *wSlice) error {
 		buf.Acquire()
 	}
 	defer buf.Release()
-	if sync && blen < store.conf.BlockSize {
+	if sync && (blen < store.conf.BlockSize || store.conf.CacheLargeWrite) {
 		// block will be freed after written into disk
 		store.bcache.cache(key, block, false, false)
 	}
@@ -448,14 +446,21 @@ func (s *wSlice) upload(indx int) {
 		}
 		if s.store.conf.Writeback {
 			stagingPath := "unknown"
+			stageFailed := false
+			block.Acquire()
 			err := utils.WithTimeout(func() (err error) { // In case it hangs for more than 5 minutes(see fileWriter.flush), fallback to uploading directly to avoid `EIO`
+				defer block.Release()
 				stagingPath, err = s.store.bcache.stage(key, block.Data, s.store.shouldCache(blen))
+				if err == nil && stageFailed { // upload thread already marked me as failed because of timeout
+					_ = s.store.bcache.removeStage(key)
+				}
 				return err
 			}, s.store.conf.PutTimeout)
 			if err != nil {
+				stageFailed = true
 				if !errors.Is(err, errStageConcurrency) {
 					s.store.stageBlockErrors.Add(1)
-					logger.Warnf("write %s to disk: %s, upload it directly", stagingPath, err)
+					logger.Warnf("write %s to disk: %s, upload it directly", key, err)
 				}
 			} else {
 				s.errors <- nil
@@ -547,6 +552,7 @@ type Config struct {
 	CacheDir          string
 	CacheMode         os.FileMode
 	CacheSize         uint64
+	CacheItems        int64
 	CacheChecksum     string
 	CacheEviction     string
 	CacheScanInterval time.Duration
@@ -568,13 +574,14 @@ type Config struct {
 	GetTimeout        time.Duration
 	PutTimeout        time.Duration
 	CacheFullBlock    bool
+	CacheLargeWrite   bool
 	BufferSize        uint64
 	Readahead         int
 	Prefetch          int
 }
 
 func (c *Config) SelfCheck(uuid string) {
-	if c.CacheSize == 0 {
+	if !c.CacheEnabled() {
 		if c.Writeback || c.Prefetch > 0 {
 			logger.Warnf("cache-size is 0, writeback and prefetch will be disabled")
 			c.Writeback = false
@@ -587,10 +594,6 @@ func (c *Config) SelfCheck(uuid string) {
 			logger.Warnf("delayed upload is disabled in non-writeback mode")
 			c.UploadDelay = 0
 			c.UploadHours = ""
-		}
-		if c.MaxStageWrite > 0 {
-			logger.Warnf("max-stage-write is disabled in non-writeback mode")
-			c.MaxStageWrite = 0
 		}
 	}
 	if _, _, err := c.parseHours(); err != nil {
@@ -615,6 +618,9 @@ func (c *Config) SelfCheck(uuid string) {
 			logger.Warnf("verify-cache-checksum should be one of %v", cs)
 			c.CacheChecksum = CsFull
 		}
+	} else if c.Writeback {
+		logger.Warnf("writeback is not supported in memory cache mode")
+		c.Writeback = false
 	}
 	if c.CacheEviction == "" {
 		c.CacheEviction = "2-random"
@@ -632,7 +638,11 @@ func (c *Config) parseHours() (start, end int, err error) {
 	if c.UploadHours == "" {
 		return
 	}
-	ps := strings.Split(c.UploadHours, ",")
+	split := ","
+	if strings.Contains(c.UploadHours, "-") {
+		split = "-"
+	}
+	ps := strings.Split(c.UploadHours, split)
 	if len(ps) != 2 {
 		err = errors.New("unexpected number of fields")
 		return
@@ -647,6 +657,10 @@ func (c *Config) parseHours() (start, end int, err error) {
 		err = errors.New("invalid hour number")
 	}
 	return
+}
+
+func (c *Config) CacheEnabled() bool {
+	return c.CacheSize > 0
 }
 
 type cachedStore struct {
@@ -811,7 +825,7 @@ func NewCachedStore(storage object.ObjectStorage, config Config, reg prometheus.
 		}
 	}()
 
-	if config.CacheSize == 0 {
+	if !config.CacheEnabled() {
 		config.Prefetch = 0 // disable prefetch if cache is disabled
 	}
 	store.fetcher = newPrefetcher(config.Prefetch, func(key string) {
@@ -1099,9 +1113,7 @@ func (store *cachedStore) FillCache(id uint64, length uint32) error {
 	keys := r.keys()
 	var err error
 	for _, k := range keys {
-		f, e := store.bcache.load(k)
-		if e == nil { // already cached
-			_ = f.Close()
+		if _, existed := store.bcache.exist(k); existed { // already cached
 			continue
 		}
 		size := parseObjOrigSize(k)
@@ -1128,19 +1140,18 @@ func (store *cachedStore) EvictCache(id uint64, length uint32) error {
 	return nil
 }
 
-func (store *cachedStore) CheckCache(id uint64, length uint32) (uint64, error) {
+func (store *cachedStore) CheckCache(id uint64, length uint32, handler func(exists bool, loc string, size int)) error {
 	r := sliceForRead(id, int(length), store)
 	keys := r.keys()
-	missBytes := uint64(0)
+	var loc string
+	var existed bool
 	for i, k := range keys {
-		tmpReader, err := store.bcache.load(k)
-		if err == nil {
-			_ = tmpReader.Close()
-			continue
+		loc, existed = store.bcache.exist(k)
+		if handler != nil {
+			handler(existed, loc, r.blockSize(i))
 		}
-		missBytes += uint64(r.blockSize(i))
 	}
-	return missBytes, nil
+	return nil
 }
 
 func (store *cachedStore) UsedMemory() int64 {

@@ -9,6 +9,13 @@ package object
 import (
 	"bytes"
 	"fmt"
+	"github.com/juicedata/juicefs/pkg/utils"
+	"github.com/pkg/errors"
+	"github.com/pkg/sftp"
+	"golang.org/x/crypto/ssh"
+	"golang.org/x/crypto/ssh/agent"
+	"golang.org/x/crypto/ssh/knownhosts"
+	"golang.org/x/term"
 	"io"
 	"math/rand"
 	"net"
@@ -23,13 +30,6 @@ import (
 	"sync"
 	"syscall"
 	"time"
-
-	"github.com/juicedata/juicefs/pkg/utils"
-	"github.com/pkg/errors"
-	"github.com/pkg/sftp"
-	"golang.org/x/crypto/ssh"
-	"golang.org/x/crypto/ssh/agent"
-	"golang.org/x/term"
 )
 
 // conn encapsulates an ssh client and corresponding sftp client
@@ -360,14 +360,14 @@ func (f *sftpStore) fileInfo(c *sftp.Client, key string, fi os.FileInfo, followL
 	return ff
 }
 
-func (f *sftpStore) List(prefix, marker, delimiter string, limit int64, followLink bool) ([]Object, error) {
+func (f *sftpStore) List(prefix, marker, token, delimiter string, limit int64, followLink bool) ([]Object, bool, string, error) {
 	if delimiter != "/" {
-		return nil, notSupported
+		return nil, false, "", notSupported
 	}
 
 	c, err := f.getSftpConnection()
 	if err != nil {
-		return nil, err
+		return nil, false, "", err
 	}
 	defer f.putSftpConnection(&c, nil)
 
@@ -382,9 +382,9 @@ func (f *sftpStore) List(prefix, marker, delimiter string, limit int64, followLi
 		obj, err := f.Head(prefix)
 		if err != nil {
 			if os.IsNotExist(err) {
-				return nil, nil
+				return nil, false, "", nil
 			}
-			return nil, err
+			return nil, false, "", err
 		}
 		objs = append(objs, obj)
 	}
@@ -392,12 +392,12 @@ func (f *sftpStore) List(prefix, marker, delimiter string, limit int64, followLi
 	if err != nil {
 		if os.IsPermission(err) {
 			logger.Warnf("skip %s: %s", dir, err)
-			return nil, nil
+			return nil, false, "", nil
 		}
 		if os.IsNotExist(err) {
-			return nil, nil
+			return nil, false, "", nil
 		}
-		return nil, err
+		return nil, false, "", err
 	}
 
 	entries := f.sortByName(c.sftpClient, dir, infos, followLink)
@@ -411,7 +411,7 @@ func (f *sftpStore) List(prefix, marker, delimiter string, limit int64, followLi
 			break
 		}
 	}
-	return objs, nil
+	return generateListResult(objs, limit)
 }
 
 func sshInteractive(user, instruction string, questions []string, echos []bool) (answers []string, err error) {
@@ -526,10 +526,20 @@ func newSftp(endpoint, username, pass, token string) (ObjectStorage, error) {
 	if pass == "" {
 		auth = append(auth, ssh.KeyboardInteractive(sshInteractive))
 	}
+	var hostKeyCallback ssh.HostKeyCallback
+	if kn := os.Getenv("SSH_KNOWN_HOSTS"); kn != "" {
+		var err error
+		hostKeyCallback, err = knownhosts.New(kn)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		hostKeyCallback = ssh.InsecureIgnoreHostKey()
+	}
 
 	config := &ssh.ClientConfig{
 		User:            username,
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+		HostKeyCallback: hostKeyCallback,
 		Timeout:         time.Second * 3,
 		Auth:            auth,
 	}

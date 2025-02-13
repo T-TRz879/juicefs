@@ -262,8 +262,12 @@ func expandPathForEmbedded(addr string) string {
 
 func getVfsConf(c *cli.Context, metaConf *meta.Config, format *meta.Format, chunkConf *chunk.Config) *vfs.Config {
 	cfg := &vfs.Config{
-		Meta:            metaConf,
-		Format:          *format,
+		Meta:   metaConf,
+		Format: *format,
+		Security: &vfs.SecurityConfig{
+			EnableCap:     c.Bool("enable-cap"),
+			EnableSELinux: c.Bool("enable-selinux"),
+		},
 		Version:         version.Version(),
 		Chunk:           chunkConf,
 		BackupMeta:      utils.Duration(c.String("backup-meta")),
@@ -349,9 +353,11 @@ func getChunkConf(c *cli.Context, format *meta.Format) *chunk.Config {
 
 		CacheDir:          c.String("cache-dir"),
 		CacheSize:         utils.ParseBytes(c, "cache-size", 'M'),
+		CacheItems:        c.Int64("cache-items"),
 		FreeSpace:         float32(c.Float64("free-space-ratio")),
 		CacheMode:         os.FileMode(cm),
 		CacheFullBlock:    !c.Bool("cache-partial-only"),
+		CacheLargeWrite:   c.Bool("cache-large-write"),
 		CacheChecksum:     c.String("verify-cache-checksum"),
 		CacheEviction:     c.String("cache-eviction"),
 		CacheScanInterval: utils.Duration(c.String("cache-scan-interval")),
@@ -643,6 +649,16 @@ func mount(c *cli.Context) error {
 			}
 		}
 		if blob != nil {
+			// test storage at startup to fail fast instead of throwing EIO in the middle of user's workload
+			if c.Bool("check-storage") {
+				start := time.Now()
+				if err = test(blob); err != nil {
+					logger.Errorf("Object storage test failed: %s", err)
+					return err
+				} else {
+					logger.Infof("Object storage test passed in %s", time.Since(start))
+				}
+			}
 			object.Shutdown(blob)
 		}
 		var foreground bool
@@ -668,7 +684,7 @@ func mount(c *cli.Context) error {
 		vfsConf.StatePath = fmt.Sprintf("/tmp/state%d.json", os.Getppid())
 	}
 
-	if st := metaCli.Chroot(meta.Background, metaConf.Subdir); st != 0 {
+	if st := metaCli.Chroot(meta.Background(), metaConf.Subdir); st != 0 {
 		return st
 	}
 	// Wrap the default registry, all prometheus.MustRegister() calls should be afterwards
@@ -687,7 +703,7 @@ func mount(c *cli.Context) error {
 		store.UpdateLimit(fmt.UploadLimit, fmt.DownloadLimit)
 	})
 	v := vfs.NewVFS(vfsConf, metaCli, store, registerer, registry)
-	installHandler(mp, v, blob)
+	installHandler(metaCli, mp, v, blob)
 	v.UpdateFormat = updateFormat(c)
 	initBackgroundTasks(c, vfsConf, metaConf, metaCli, blob, registerer, registry)
 	mountMain(v, c)

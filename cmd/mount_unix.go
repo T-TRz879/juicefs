@@ -59,12 +59,16 @@ func showThreadStack(agentAddr string) {
 	if agentAddr == "" {
 		return
 	}
-	resp, err := http.Get(fmt.Sprintf("http://%s/debug/pprof/goroutine?debug=2", agentAddr))
+	client := http.Client{
+		Timeout: 10 * time.Second,
+	}
+	resp, err := client.Get(fmt.Sprintf("http://%s/debug/pprof/goroutine?debug=2", agentAddr))
 	if err != nil {
 		logger.Warnf("list goroutine from %s: %s", agentAddr, err)
 	} else {
 		grs, _ := io.ReadAll(resp.Body)
 		logger.Infof("list goroutines from %s:\n%s", agentAddr, string(grs))
+		_ = resp.Body.Close()
 	}
 }
 
@@ -204,6 +208,7 @@ func checkMountpoint(name, mp, logPath string, background bool) {
 		logger.Infof("\033[92mOK\033[0m, %s with special mount point %s", name, mp)
 		return
 	}
+	_, oldConf, _ := loadConfig(mp)
 	mountTimeOut := 10 // default 10 seconds
 	interval := 500    // check every 500 Millisecond
 	if tStr, ok := os.LookupEnv("JFS_MOUNT_TIMEOUT"); ok {
@@ -218,6 +223,13 @@ func checkMountpoint(name, mp, logPath string, background bool) {
 		st, err := os.Stat(mp)
 		if err == nil {
 			if sys, ok := st.Sys().(*syscall.Stat_t); ok && sys.Ino == uint64(meta.RootInode) {
+				// in pod, pid probably the same
+				if csiCommPath == "" && oldConf != nil {
+					_, newConf, _ := loadConfig(mp)
+					if newConf == nil || newConf.Pid == oldConf.Pid {
+						continue
+					}
+				}
 				logger.Infof("\033[92mOK\033[0m, %s is ready at %s", name, mp)
 				return
 			}
@@ -304,12 +316,24 @@ func fuseFlags() []cli.Flag {
 			Usage: "enable extended attributes (xattr)",
 		},
 		&cli.BoolFlag{
+			Name:  "enable-cap",
+			Usage: "enable security.capability xattr",
+		},
+		&cli.BoolFlag{
+			Name:  "enable-selinux",
+			Usage: "enable security.selinux xattr",
+		},
+		&cli.BoolFlag{
 			Name:  "enable-ioctl",
 			Usage: "enable ioctl (support GETFLAGS/SETFLAGS only)",
 		},
 		&cli.StringFlag{
 			Name:  "root-squash",
 			Usage: "mapping local root user (uid = 0) to another one specified as <uid>:<gid>",
+		},
+		&cli.StringFlag{
+			Name:  "all-squash",
+			Usage: "mapping all users to another one specified as <uid>:<gid>",
 		},
 		&cli.BoolFlag{
 			Name:  "prefix-internal",
@@ -698,7 +722,7 @@ func adjustOOMKiller(score int) {
 	}
 }
 
-func installHandler(mp string, v *vfs.VFS, blob object.ObjectStorage) {
+func installHandler(m meta.Meta, mp string, v *vfs.VFS, blob object.ObjectStorage) {
 	// Go will catch all the signals
 	signal.Ignore(syscall.SIGPIPE)
 	signalChan := make(chan os.Signal, 10)
@@ -715,6 +739,7 @@ func installHandler(mp string, v *vfs.VFS, blob object.ObjectStorage) {
 					if err != nil {
 						logger.Fatalf("flush buffered data failed: %s", err)
 					}
+					m.FlushSession()
 					object.Shutdown(blob)
 					logger.Warnf("exit with code 1")
 					os.Exit(1)
@@ -781,26 +806,31 @@ func launchMount(mp string, conf *vfs.Config) error {
 		os.Unsetenv("_FUSE_STATE_PATH")
 		mountPid = cmd.Process.Pid
 
+		notInCSI := os.Getenv("JFS_SUPER_COMM") == ""
 		signalChan := make(chan os.Signal, 10)
-		signal.Notify(signalChan, syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP)
-		go func() {
-			for {
-				sig := <-signalChan
-				if sig == nil {
-					return
+		if notInCSI {
+			signal.Notify(signalChan, syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP)
+			go func() {
+				for {
+					sig := <-signalChan
+					if sig == nil {
+						return
+					}
+					logger.Infof("received signal %s, propagating to child process %d...", sig.String(), mountPid)
+					if err := cmd.Process.Signal(sig); err != nil && !errors.Is(err, os.ErrProcessDone) {
+						logger.Errorf("send signal %s to %d: %s", sig.String(), mountPid, err)
+					}
 				}
-				logger.Infof("received signal %s, propagating to child process %d...", sig.String(), mountPid)
-				if err := cmd.Process.Signal(sig); err != nil {
-					logger.Errorf("send signal %s to %d: %s", sig.String(), mountPid, err)
-				}
-			}
-		}()
+			}()
+		}
 
 		ctx, cancel := context.WithCancel(context.TODO())
 		go watchdog(ctx, mp)
 		err = cmd.Wait()
 		cancel()
-		signal.Stop(signalChan)
+		if notInCSI {
+			signal.Stop(signalChan)
+		}
 		close(signalChan)
 		if err == nil {
 			return nil
@@ -823,6 +853,53 @@ func launchMount(mp string, conf *vfs.Config) error {
 	}
 }
 
+func getNobodyUIDGID() (uint32, uint32) {
+	var uid, gid uint32 = 65534, 65534
+	if u, err := user.Lookup("nobody"); err == nil {
+		nobody, err := strconv.ParseUint(u.Uid, 10, 32)
+		if err != nil {
+			logger.Fatalf("invalid uid: %s", u.Uid)
+		}
+		uid = uint32(nobody)
+	}
+	if g, err := user.LookupGroup("nogroup"); err == nil {
+		nogroup, err := strconv.ParseUint(g.Gid, 10, 32)
+		if err != nil {
+			logger.Fatalf("invalid gid: %s", g.Gid)
+		}
+		gid = uint32(nogroup)
+	}
+	return uid, gid
+}
+
+func parseUIDGID(input string, defaultUid uint32, defaultGid uint32) (uint32, uint32) {
+	ss := strings.SplitN(strings.TrimSpace(input), ":", 2)
+	uid, gid := defaultUid, defaultGid
+	if ss[0] != "" {
+		u, err := strconv.ParseUint(ss[0], 10, 32)
+		if err != nil {
+			logger.Fatalf("invalid uid: %s", ss[0])
+		}
+		uid = uint32(u)
+		if uid == 0 {
+			logger.Warnf("Can't map uid as 0, use %d instead", defaultUid)
+			uid = defaultUid
+		}
+	}
+	if len(ss) == 2 && ss[1] != "" {
+		g, err := strconv.ParseUint(ss[1], 10, 32)
+		if err != nil {
+			logger.Fatalf("invalid gid: %s", ss[1])
+		}
+		gid = uint32(g)
+		if gid == 0 {
+			logger.Warnf("Can't map gid as 0, use %d instead", defaultGid)
+			gid = defaultGid
+		}
+	}
+	return uid, gid
+}
+
 func mountMain(v *vfs.VFS, c *cli.Context) {
 	if os.Getuid() == 0 {
 		disableUpdatedb()
@@ -831,41 +908,32 @@ func mountMain(v *vfs.VFS, c *cli.Context) {
 	conf.AttrTimeout = utils.Duration(c.String("attr-cache"))
 	conf.EntryTimeout = utils.Duration(c.String("entry-cache"))
 	conf.DirEntryTimeout = utils.Duration(c.String("dir-entry-cache"))
+	conf.ReaddirCache = c.Bool("readdir-cache")
+	if conf.ReaddirCache {
+		if conf.AttrTimeout == 0 {
+			logger.Warnf("readdir-cache is enabled without attr-cache, it's performance may be affected")
+		}
+		major, minor := utils.GetKernelVersion()
+		if major < 4 || (major == 4 && minor < 20) {
+			logger.Warnf("readdir-cache requires kernel version 4.20 or higher, current version: %d.%d", major, minor)
+		}
+	}
 	conf.NonDefaultPermission = c.Bool("non-default-permission")
 	rootSquash := c.String("root-squash")
-	if rootSquash != "" {
-		var uid, gid uint32 = 65534, 65534
-		if u, err := user.Lookup("nobody"); err == nil {
-			nobody, err := strconv.ParseUint(u.Uid, 10, 32)
-			if err != nil {
-				logger.Fatalf("invalid uid: %s", u.Uid)
-			}
-			uid = uint32(nobody)
+	allSquash := c.String("all-squash")
+	if allSquash != "" || rootSquash != "" {
+		nobodyUid, nobodyGid := getNobodyUIDGID()
+		// all-squash takes precedence over root-squash
+		if allSquash != "" {
+			conf.NonDefaultPermission = true // disable kernel permission check
+			uid, gid := parseUIDGID(allSquash, nobodyUid, nobodyGid)
+			conf.AllSquash = &vfs.AnonymousAccount{Uid: uid, Gid: gid}
+			logger.Infof("Map all uid/gid to %d/%d by setting all-squash", uid, gid)
+		} else { // rootSquash != ""
+			uid, gid := parseUIDGID(rootSquash, nobodyUid, nobodyGid)
+			conf.RootSquash = &vfs.AnonymousAccount{Uid: uid, Gid: gid}
+			logger.Infof("Map root uid/gid 0 to %d/%d by setting root-squash", uid, gid)
 		}
-		if g, err := user.LookupGroup("nogroup"); err == nil {
-			nogroup, err := strconv.ParseUint(g.Gid, 10, 32)
-			if err != nil {
-				logger.Fatalf("invalid gid: %s", g.Gid)
-			}
-			gid = uint32(nogroup)
-		}
-
-		ss := strings.SplitN(strings.TrimSpace(rootSquash), ":", 2)
-		if ss[0] != "" {
-			u, err := strconv.ParseUint(ss[0], 10, 32)
-			if err != nil {
-				logger.Fatalf("invalid uid: %s", ss[0])
-			}
-			uid = uint32(u)
-		}
-		if len(ss) == 2 && ss[1] != "" {
-			g, err := strconv.ParseUint(ss[1], 10, 32)
-			if err != nil {
-				logger.Fatalf("invalid gid: %s", ss[1])
-			}
-			gid = uint32(g)
-		}
-		conf.RootSquash = &vfs.RootSquash{Uid: uid, Gid: gid}
 	}
 	logger.Infof("Mounting volume %s at %s ...", conf.Format.Name, conf.Meta.MountPoint)
 	err := fuse.Serve(v, c.String("o"), c.Bool("enable-xattr"), c.Bool("enable-ioctl"))

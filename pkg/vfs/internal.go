@@ -267,17 +267,22 @@ type SummaryReponse struct {
 }
 
 type CacheResponse struct {
+	sync.Mutex
 	FileCount  uint64
 	SliceCount uint64
 	TotalBytes uint64
 	MissBytes  uint64 // for check op
+	Locations  map[string]uint64
 }
 
-func (resp *CacheResponse) Add(other CacheResponse) {
+func (resp *CacheResponse) Add(other *CacheResponse) {
 	resp.FileCount += other.FileCount
 	resp.TotalBytes += other.TotalBytes
 	resp.SliceCount += other.SliceCount
 	resp.MissBytes += other.MissBytes
+	for k, bytes := range other.Locations {
+		resp.Locations[k] += bytes
+	}
 }
 
 type chunkSlice struct {
@@ -297,10 +302,18 @@ func (v *VFS) handleInternalMsg(ctx meta.Context, cmd uint32, r *utils.Buffer, o
 		done := make(chan struct{})
 		inode := Ino(r.Get64())
 		name := string(r.Get(int(r.Get8())))
+		var skipTrash bool
+		var numThreads int = meta.RmrDefaultThreads
+		if r.HasMore() {
+			skipTrash = r.Get8()&1 != 0
+		}
+		if r.HasMore() {
+			numThreads = int(r.Get8())
+		}
 		var count uint64
 		var st syscall.Errno
 		go func() {
-			st = v.Meta.Remove(ctx, inode, name, &count)
+			st = v.Meta.Remove(ctx, inode, name, skipTrash, numThreads, &count)
 			if st != 0 {
 				logger.Errorf("remove %d/%s: %s", inode, name, st)
 			}
@@ -530,18 +543,17 @@ func (v *VFS) handleInternalMsg(ctx meta.Context, cmd uint32, r *utils.Buffer, o
 			action = CacheAction(r.Get8())
 		}
 
-		var stat CacheResponse
+		stat := &CacheResponse{Locations: make(map[string]uint64)}
 		if background == 0 {
 			done := make(chan struct{})
 			go func() {
-				v.cache(ctx, action, paths, int(concurrent), &stat)
+				v.cache(ctx, action, paths, int(concurrent), stat)
 				close(done)
 			}()
 			writeProgress(&stat.FileCount, &stat.TotalBytes, out, done)
 		} else {
 			go v.cache(meta.NewContext(ctx.Pid(), ctx.Uid(), ctx.Gids()), action, paths, int(concurrent), nil)
 		}
-
 		data, err := json.Marshal(stat)
 		if err != nil {
 			logger.Errorf("marshal response error: %v", err)

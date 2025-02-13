@@ -19,6 +19,7 @@ package fuse
 import (
 	"fmt"
 	"log"
+	"math"
 	"os"
 	"os/exec"
 	"runtime"
@@ -298,7 +299,12 @@ func (fs *fileSystem) Fallocate(cancel <-chan struct{}, in *fuse.FallocateIn) (c
 func (fs *fileSystem) CopyFileRange(cancel <-chan struct{}, in *fuse.CopyFileRangeIn) (written uint32, code fuse.Status) {
 	ctx := fs.newContext(cancel, &in.InHeader)
 	defer releaseContext(ctx)
-	copied, err := fs.v.CopyFileRange(ctx, Ino(in.NodeId), in.FhIn, in.OffIn, Ino(in.NodeIdOut), in.FhOut, in.OffOut, in.Len, uint32(in.Flags))
+	var len = in.Len
+	if len > math.MaxUint32 {
+		// written may overflow
+		len = math.MaxUint32 + 1 - meta.ChunkSize
+	}
+	copied, err := fs.v.CopyFileRange(ctx, Ino(in.NodeId), in.FhIn, in.OffIn, Ino(in.NodeIdOut), in.FhOut, in.OffOut, len, uint32(in.Flags))
 	if err != 0 {
 		return 0, fuse.Status(err)
 	}
@@ -347,6 +353,9 @@ func (fs *fileSystem) OpenDir(cancel <-chan struct{}, in *fuse.OpenIn, out *fuse
 	defer releaseContext(ctx)
 	fh, err := fs.v.Opendir(ctx, Ino(in.NodeId), in.Flags)
 	out.Fh = fh
+	if fs.conf.ReaddirCache {
+		out.OpenFlags |= fuse.FOPEN_CACHE_DIR | fuse.FOPEN_KEEP_CACHE // both flags are required
+	}
 	return fuse.Status(err)
 }
 
@@ -465,7 +474,7 @@ func Serve(v *vfs.VFS, options string, xattrs, ioctl bool) error {
 		logger.Infof("The format \"enable-acl\" flag will enable the xattrs feature.")
 		opt.DisableXAttrs = false
 	}
-	opt.IgnoreSecurityLabels = !opt.EnableAcl
+	opt.IgnoreSecurityLabels = false
 
 	for _, n := range strings.Split(options, ",") {
 		if n == "allow_other" || n == "allow_root" {
@@ -526,7 +535,7 @@ func GenFuseOpt(conf *vfs.Config, options string, mt int, noxattr, noacl bool, m
 	opt.EnableLocks = true
 	opt.DisableXAttrs = noxattr
 	opt.EnableAcl = !noacl
-	opt.IgnoreSecurityLabels = noacl
+	opt.IgnoreSecurityLabels = false
 	opt.MaxWrite = maxWrite
 	opt.MaxReadAhead = 1 << 20
 	opt.DirectMount = true

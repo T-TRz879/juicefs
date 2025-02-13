@@ -40,6 +40,8 @@ const (
 	legacySessions = "sessions"
 )
 
+var counterNames = []string{usedSpace, totalInodes, "nextInode", "nextChunk", "nextSession", "nextTrash"}
+
 const (
 	// fallocate
 	fallocKeepSize  = 0x01
@@ -332,7 +334,7 @@ func (m *baseMeta) emptyEntry(ctx Context, parent Ino, name string, inode Ino, s
 	return st
 }
 
-func (m *baseMeta) Remove(ctx Context, parent Ino, name string, count *uint64) syscall.Errno {
+func (m *baseMeta) Remove(ctx Context, parent Ino, name string, skipTrash bool, numThreads int, count *uint64) syscall.Errno {
 	parent = m.checkRoot(parent)
 	if st := m.Access(ctx, parent, MODE_MASK_W|MODE_MASK_X, nil); st != 0 {
 		return st
@@ -348,8 +350,16 @@ func (m *baseMeta) Remove(ctx Context, parent Ino, name string, count *uint64) s
 		}
 		return m.Unlink(ctx, parent, name)
 	}
-	concurrent := make(chan int, 50)
-	return m.emptyEntry(ctx, parent, name, inode, false, count, concurrent)
+	if numThreads <= 0 {
+		logger.Infof("invalid threads number %d , auto adjust to %d", numThreads, RmrDefaultThreads)
+		numThreads = RmrDefaultThreads
+	} else if numThreads > 255 {
+		logger.Infof("threads number %d too large, auto adjust to 255 .", numThreads)
+		numThreads = 255
+	}
+	logger.Debugf("Start emptyEntry with %d concurrent threads .", numThreads)
+	concurrent := make(chan int, numThreads)
+	return m.emptyEntry(ctx, parent, name, inode, skipTrash, count, concurrent)
 }
 
 func (m *baseMeta) GetSummary(ctx Context, inode Ino, summary *Summary, recursive bool, strict bool) syscall.Errno {
